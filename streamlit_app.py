@@ -6,6 +6,7 @@ import streamlit as st
 import agent
 import analytics
 import loading
+import pandas as pd
 
 MAX_QUESTIONS = 15  # per-session limit for the assistant
 
@@ -91,9 +92,217 @@ with tab_data:
     right.subheader('Data types')
     right.dataframe(profile['dtypes'])
 
+
 with tab_dash:
-    st.info('TODO: KPIs, filters, and at least three charts go here. '
-            'Calculate everything from the loaded data. Never hardcode results.')
+    st.header("Business Performance Dashboard")
+    st.caption(
+        "Select the columns that describe your business data. "
+        "Metrics and charts update when filters change."
+    )
+
+    data = df.copy()
+
+    if data.empty or len(data.columns) == 0:
+        st.warning("The selected table has no usable data.")
+        st.stop()
+
+    columns = data.columns.tolist()
+
+    # ---------- Column configuration ----------
+    st.subheader("1. Configure your metrics")
+
+    numeric_cols = data.select_dtypes(include="number").columns.tolist()
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        metric_col = st.selectbox(
+            "Numeric measure (e.g., revenue)",
+            ["None"] + numeric_cols,
+            key="dashboard_metric",
+        )
+
+    with c2:
+        date_col = st.selectbox(
+            "Date column (optional)",
+            ["None"] + columns,
+            key="dashboard_date",
+        )
+
+    with c3:
+        group_col = st.selectbox(
+            "Category or grouping column",
+            ["None"] + columns,
+            key="dashboard_group",
+        )
+
+    if metric_col == "None":
+        st.info("Choose a numeric measure to calculate metrics and charts.")
+        st.stop()
+
+    # ---------- Date preparation ----------
+    if date_col != "None":
+        parsed_dates = pd.to_datetime(data[date_col], errors="coerce")
+        valid_dates = parsed_dates.notna()
+
+        if valid_dates.any():
+            data[date_col] = parsed_dates
+            data["_dashboard_year"] = parsed_dates.dt.year
+        else:
+            st.warning(
+                f"Column '{date_col}' could not be interpreted as dates. "
+                "Date filtering and time-series charts are unavailable."
+            )
+            date_col = "None"
+
+    # ---------- Interactive filters ----------
+    st.subheader("2. Filter the data")
+
+    filtered = data.copy()
+
+    if date_col != "None":
+        years = sorted(
+            filtered["_dashboard_year"].dropna().unique().tolist()
+        )
+        if years:
+            selected_years = st.multiselect(
+                "Year",
+                years,
+                default=years,
+                key="dashboard_year_filter",
+            )
+            filtered = filtered[
+                filtered["_dashboard_year"].isin(selected_years)
+            ]
+
+    # Add filters for columns with a manageable number of categories.
+    filter_cols = [
+        col for col in columns
+        if col != date_col
+        and col != metric_col
+        and data[col].nunique(dropna=True) <= 50
+        and data[col].nunique(dropna=True) > 1
+    ]
+
+    selected_filter_cols = st.multiselect(
+        "Choose additional filter dimensions",
+        filter_cols,
+        key="dashboard_filter_dimensions",
+        help="For example, product category, store, or sales channel.",
+    )
+
+    if selected_filter_cols:
+        filter_layout = st.columns(min(3, len(selected_filter_cols)))
+
+        for i, col in enumerate(selected_filter_cols):
+            options = sorted(
+                filtered[col].dropna().unique().tolist(),
+                key=str,
+            )
+
+            with filter_layout[i % len(filter_layout)]:
+                selected = st.multiselect(
+                    col,
+                    options,
+                    default=options,
+                    key=f"dashboard_filter_{col}",
+                )
+
+            filtered = filtered[filtered[col].isin(selected)]
+
+    st.caption(
+        f"{len(filtered):,} of {len(data):,} rows match the filters."
+    )
+
+    if filtered.empty:
+        st.warning("No records match the selected filters.")
+        st.stop()
+
+    # ---------- KPI cards ----------
+    st.subheader("3. Key metrics")
+
+    values = pd.to_numeric(filtered[metric_col], errors="coerce")
+    total = values.sum()
+    valid_values = values.dropna()
+
+    k1, k2, k3, k4 = st.columns(4)
+
+    k1.metric(f"Total {metric_col}", f"{total:,.2f}")
+    k2.metric("Average per row", f"{valid_values.mean():,.2f}"
+              if not valid_values.empty else "N/A")
+    k3.metric("Valid numeric records", f"{len(valid_values):,}")
+    k4.metric("Rows included", f"{len(filtered):,}")
+
+    # ---------- Visualization 1: trend over time ----------
+    st.subheader("4. Visualizations")
+
+    if date_col != "None":
+        trend_data = filtered.dropna(subset=[date_col]).copy()
+        trend_data[metric_col] = pd.to_numeric(
+            trend_data[metric_col], errors="coerce"
+        )
+
+        trend = (
+            trend_data.set_index(date_col)[metric_col]
+            .resample("MS")
+            .sum()
+            .rename(f"Total {metric_col}")
+        )
+
+        st.markdown("**Chart 1 — Monthly trend**")
+        st.line_chart(trend, y=f"Total {metric_col}")
+    else:
+        st.info(
+            "Chart 1: Select a date column to display a monthly trend."
+        )
+
+    # ---------- Visualization 2: breakdown ----------
+    if group_col != "None":
+        breakdown_data = filtered.copy()
+        breakdown_data[metric_col] = pd.to_numeric(
+            breakdown_data[metric_col], errors="coerce"
+        )
+
+        breakdown = (
+            breakdown_data.dropna(subset=[group_col, metric_col])
+            .groupby(group_col)[metric_col]
+            .sum()
+            .sort_values(ascending=False)
+        )
+
+        st.markdown(f"**Chart 2 — {metric_col} by {group_col}**")
+        st.bar_chart(breakdown, y=metric_col)
+    else:
+        st.info(
+            "Chart 2: Select a grouping column to compare categories."
+        )
+
+    # ---------- Visualization 3: distribution ----------
+    st.markdown(f"**Chart 3 — Distribution of {metric_col}**")
+    st.bar_chart(
+        valid_values.value_counts(bins=10, sort=False)
+        .rename("Number of records"),
+        y="Number of records",
+    )
+
+    # ---------- Data quality ----------
+    with st.expander("Data quality for the selected table"):
+        profile = analytics.profile_table(data)
+
+        q1, q2, q3 = st.columns(3)
+        q1.metric("Source rows", f"{profile['rows']:,}")
+        q2.metric("Columns", profile["columns"])
+        q3.metric("Duplicate rows", profile["duplicate_rows"])
+
+        st.markdown("**Missing values by column**")
+        st.dataframe(profile["missing"], hide_index=True)
+
+        st.markdown("**Data types**")
+        st.dataframe(profile["dtypes"], hide_index=True)
+
+        st.markdown("**Filtered records**")
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+
 
 with tab_assistant:
     st.caption('Mode: rules-based starter. Describe what you actually built here.')
