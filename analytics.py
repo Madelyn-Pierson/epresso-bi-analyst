@@ -248,15 +248,23 @@ def suggest_join_keys(left: pd.DataFrame, right: pd.DataFrame, min_overlap: floa
     def squash(name):
         return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
+    # iterate by POSITION so a table with repeated column names cannot break this, and skip
+    # any single column that cannot be read rather than failing the whole app
     right_sets = {}
-    for rc in right.columns:
-        k = _norm_key(right[rc]).dropna()
-        if len(k) and k.is_unique:
-            right_sets[rc] = set(k)
+    for i, rc in enumerate(right.columns):
+        try:
+            k = _norm_key(right.iloc[:, i]).dropna()
+            if len(k) and k.is_unique:
+                right_sets[rc] = set(k)
+        except Exception:
+            continue
 
     suggestions = []
-    for lc in left.columns:
-        lk = _norm_key(left[lc]).dropna()
+    for i, lc in enumerate(left.columns):
+        try:
+            lk = _norm_key(left.iloc[:, i]).dropna()
+        except Exception:
+            continue
         if lk.empty:
             continue
         for rc, rset in right_sets.items():

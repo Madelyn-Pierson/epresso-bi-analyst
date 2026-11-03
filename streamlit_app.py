@@ -7,6 +7,7 @@ The dashboard calls the SAME functions as the assistant, so what you validate ag
 Power BI is exactly what the assistant will later report."""
 import calendar
 import re
+import traceback
 
 import pandas as pd
 import streamlit as st
@@ -91,7 +92,13 @@ def render_model_tab(usable: dict):
     st.subheader('2. Lookup tables')
     merged = fact.copy()
     others = [n for n in names if n != fact_name]
-    suggestions = {n: analytics.suggest_join_keys(fact, usable[n].df) for n in others}
+    suggestions = {}
+    for n in others:
+        try:
+            suggestions[n] = analytics.suggest_join_keys(fact, usable[n].df)
+        except Exception as exc:  # never let key detection take down the app
+            suggestions[n] = []
+            st.warning(f'Could not auto-detect keys for {n} ({type(exc).__name__}: {exc}). Choose them manually.')
     others.sort(key=lambda n: 0 if suggestions[n] else 1)  # tables with an obvious key first
     guess_value_col = analytics.suggest_revenue_column(fact)
     join_reports = []
@@ -352,13 +359,21 @@ with tab_data:
 
 model = None
 with tab_model:
-    model = render_model_tab(usable)
+    try:
+        model = render_model_tab(usable)
+    except Exception as exc:  # show the real error (Streamlit Cloud redacts it otherwise)
+        st.error(f'Model tab error: {type(exc).__name__}: {exc}')
+        st.code(traceback.format_exc())
 
 with tab_dash:
     if model is None:
         st.info('Finish the Model tab first.')
     else:
-        render_dashboard(model)
+        try:
+            render_dashboard(model)
+        except Exception as exc:
+            st.error(f'Dashboard error: {type(exc).__name__}: {exc}')
+            st.code(traceback.format_exc())
 
 with tab_assistant:
     st.caption('Mode: rules-based starter. Describe what you actually built here.')
