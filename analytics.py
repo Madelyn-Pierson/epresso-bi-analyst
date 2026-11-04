@@ -1,513 +1,942 @@
-"""Business logic. Keep Streamlit code OUT of this file so every function can be
-tested on its own and reused by the dashboard AND the assistant.
+"""
+analytics.py - E-Presso data loading, preparation, profiling and analytical functions.
 
-Sections
-  1. loading helpers (legacy) and profiling
-  2. model layer: join_tables, add_revenue, add_date_parts, column detectors
-  3. the tool contract (ToolResult)
-  4. analytical tools: get_total, group_total, monthly_revenue, top_n,
-     revenue_share, yoy_growth, data_quality_report
+Everything the dashboard and the assistant report is calculated here, from whatever
+data is currently loaded. Nothing is hardcoded: years, stores, channels and categories
+are all discovered from the data, so an updated dataset works without code changes.
+
+Layout
+  1. Loading      - read CSV/Excel files, recognise which table each one is
+  2. Preparation  - clean types, join lookup tables (many-to-one only), reconcile totals
+  3. Profiling    - row counts, missing values, duplicates, orphan keys, grain checks
+  4. Core metrics - small DataFrame helpers shared by the dashboard AND the assistant
+  5. Tools        - the analytical functions the assistant is allowed to call
 """
 from __future__ import annotations
 
+import csv
 import io
+import math
 import re
-import warnings
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 
-EXCEL_EXT = ('.xlsx', '.xlsm', '.xls')
-TEXT_EXT = ('.csv', '.txt', '.tsv')
-BLANK = '(blank)'  # label used in filters for rows where the value is missing
+# --------------------------------------------------------------------------------------
+# 1. LOADING
+# --------------------------------------------------------------------------------------
+
+# canonical column name -> accepted normalised header spellings
+TABLE_SPECS: dict[str, dict[str, list[str]]] = {
+    "sales": {
+        "Sales ID": ["salesid"],
+        "Date": ["date"],
+        "Store ID": ["storeid"],
+        "Category ID": ["categoryid"],
+        "Product ID": ["productid"],
+        "Revenue": ["revenue"],
+    },
+    "survey": {
+        "Survey ID": ["surveyid"],
+        "Store ID": ["storeid"],
+        "Year": ["year"],
+        "Satisfaction": ["satisfaction"],
+        "Interest": ["interest"],
+    },
+    "stores": {
+        "ID": ["id", "storeid"],
+        "City": ["city"],
+        "State": ["state"],
+        "StoreType": ["storetype"],
+    },
+    "products": {"Product ID": ["productid"], "Product": ["product", "productname"]},
+    "categories": {"Category ID": ["categoryid"], "Category": ["category", "categoryname"]},
+}
+CHECK_ORDER = ["sales", "survey", "stores", "products", "categories"]
+REQUIRED_TABLES = ["sales", "stores"]
+KEYS = {
+    "sales": ["Sales ID"],
+    "products": ["Product ID"],
+    "categories": ["Category ID"],
+    "stores": ["ID"],
+    "survey": ["Survey ID"],
+}
+
+MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
-# ================================================================ 1. loading / profiling
-def excel_sheet_names(file_bytes: bytes) -> list[str]:
-    return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
+def _norm(name) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
 
 
-def load_table(file_bytes: bytes, filename: str, sheet_name=0) -> pd.DataFrame:
-    """Read an uploaded CSV / TXT / TSV / Excel file into a DataFrame."""
-    name = filename.lower()
-    buffer = io.BytesIO(file_bytes)
-    if name.endswith(EXCEL_EXT):
-        return pd.read_excel(buffer, sheet_name=sheet_name)
-    if name.endswith(TEXT_EXT):
-        return pd.read_csv(buffer, sep=None, engine='python')  # sniffs the delimiter
-    raise ValueError(f'Unsupported file type: {filename}')
-
-
-def profile_table(df: pd.DataFrame) -> dict:
-    """Basic profile: size, duplicates, missing values, data types."""
-    missing = df.isna().sum()
-    return {
-        'rows': len(df),
-        'columns': df.shape[1],
-        'duplicate_rows': int(df.duplicated().sum()),
-        'missing': pd.DataFrame({
-            'column': missing.index,
-            'missing': missing.values,
-            'pct_missing': (missing.values / max(len(df), 1) * 100).round(2),
-        }),
-        'dtypes': pd.DataFrame({'column': df.columns, 'dtype': df.dtypes.astype(str).values}),
-    }
-
-
-# ================================================================ 2. model layer
-class JoinError(ValueError):
-    """A join was refused because it would be unsafe. The message is safe to show."""
-
-
-def _is_texty(s: pd.Series) -> bool:
-    return (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)
-            or isinstance(s.dtype, pd.CategoricalDtype))
-
-
-def _norm_key(s: pd.Series) -> pd.Series:
-    """Make join keys comparable: trim spaces, treat '' as missing, and make 101 == 101.0.
-    Only used for matching. The real columns are never changed."""
-    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-        def fmt(v):
-            if pd.isna(v):
-                return None
-            f = float(v)
-            return str(int(f)) if f.is_integer() else str(f)
-        return s.map(fmt).astype(object)
-    out = s.astype('string').str.strip()
-    out = out.mask(out == '')
-    return out.astype(object).where(out.notna(), None)
-
-
-def join_tables(left: pd.DataFrame, right: pd.DataFrame, left_on: str, right_on: str,
-                right_name: str = 'lookup', value_col: str | None = None):
-    """Safe many-to-one LEFT join: every row of `left` is kept exactly once.
-
-    Refuses (JoinError) if `right_on` is not unique, because that would duplicate rows and
-    inflate totals. Returns (merged, report). The report shows unmatched rows, so a key
-    problem (spaces, text vs number, a missing store) is visible instead of silent.
-    Right-hand columns whose names already exist are renamed 'name (right_name)'.
-    The right-hand key column is dropped (it equals the left key)."""
-    for frame, col, side in ((left, left_on, 'the model so far'), (right, right_on, right_name)):
-        if col not in frame.columns:
-            raise JoinError(f"Column '{col}' was not found in {side}.")
-
-    lk = _norm_key(left[left_on])
-    rk = _norm_key(right[right_on])
-    keep = rk.notna().values
-    right_ok, rk_ok = right.loc[keep], rk[keep]
-
-    dup = rk_ok[rk_ok.duplicated(keep=False)]
-    if len(dup):
-        examples = sorted(map(str, dup.unique()))[:5]
-        raise JoinError(
-            f"'{right_on}' in {right_name} is not unique ({dup.nunique()} value(s) repeat, "
-            f"e.g. {examples}). Joining on it would duplicate rows and inflate totals. "
-            f"Choose a column that identifies each row once.")
-
-    rest = right_ok.drop(columns=[right_on])
-    rest = rest.rename(columns={c: f'{c} ({right_name})' for c in rest.columns if c in left.columns})
-    added = list(rest.columns)
-    rest = rest.assign(_join_key=rk_ok.values)
-    merged = left.assign(_join_key=lk.values).merge(
-        rest, on='_join_key', how='left', validate='many_to_one', indicator=True)
-
-    unmatched = merged['_merge'] == 'left_only'
-    n_unmatched = int(unmatched.sum())
-    report = {
-        'right_table': right_name, 'left_key': left_on, 'right_key': right_on,
-        'rows_before': len(left), 'rows_after': len(merged),
-        'row_count_changed': len(merged) != len(left),
-        'unmatched_rows': n_unmatched,
-        'unmatched_pct': round(100 * n_unmatched / max(len(left), 1), 2),
-        'null_key_rows': int(lk.isna().sum()),
-        'unmatched_key_examples': [str(k) for k in merged.loc[unmatched, '_join_key'].dropna().unique()[:10]],
-        'lookup_rows_never_used': int(len(right_ok) - rk_ok.isin(set(lk.dropna())).sum()),
-        'added_columns': added,
-    }
-    if value_col and value_col in left.columns:
-        before = float(pd.to_numeric(left[value_col], errors='coerce').sum())
-        after = float(pd.to_numeric(merged[value_col], errors='coerce').sum())
-        report.update(sum_before=before, sum_after=after, sum_changed=abs(before - after) > 1e-6)
-    return merged.drop(columns=['_join_key', '_merge']), report
-
-
-def add_revenue(df: pd.DataFrame, qty_col: str, price_col: str,
-                discount_col: str | None = None, name: str = 'Revenue'):
-    """Create a revenue column = quantity x price (x (1 - discount)).
-    discount_col must hold FRACTIONS (0.10 = 10%). Returns (new_df, report)."""
-    for col in (qty_col, price_col, discount_col):
-        if col and col not in df.columns:
-            raise ValueError(f"Column '{col}' was not found.")
-    if name in df.columns:
-        raise ValueError(f"A column named '{name}' already exists. Use it, or choose another name.")
-    qty = pd.to_numeric(df[qty_col], errors='coerce').astype('float64')
-    price = pd.to_numeric(df[price_col], errors='coerce').astype('float64')
-    revenue = qty * price
-    definition = f'{qty_col} x {price_col}'
-    if discount_col:
-        disc = pd.to_numeric(df[discount_col], errors='coerce').astype('float64')
-        if disc.max() > 1 or disc.min() < 0:
-            raise ValueError(f"'{discount_col}' has values outside 0-1. Convert percentages to "
-                             f"fractions first (10% -> 0.10).")
-        revenue = revenue * (1 - disc.fillna(0))
-        definition += f' x (1 - {discount_col})'
-    out = df.copy()
-    out[name] = revenue
-    return out, {'definition': definition, 'rows': len(df),
-                 'rows_without_revenue': int(revenue.isna().sum()),
-                 'total': float(revenue.sum())}
-
-
-def _parse_dates(s: pd.Series) -> pd.Series:
-    if pd.api.types.is_datetime64_any_dtype(s):
-        return s
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        return pd.to_datetime(s, errors='coerce')
-
-
-def add_date_parts(df: pd.DataFrame, date_col: str):
-    """Make `date_col` a real datetime and add '<col> Year' and '<col> Month' (1-12) columns.
-    Returns (new_df, report)."""
-    if date_col not in df.columns:
-        raise ValueError(f"Column '{date_col}' was not found.")
-    parsed = _parse_dates(df[date_col])
-    out = df.copy()
-    out[date_col] = parsed
-    year_col, month_col = f'{date_col} Year', f'{date_col} Month'
-    out[year_col] = parsed.dt.year.astype('Int64')
-    out[month_col] = parsed.dt.month.astype('Int64')
-    return out, {
-        'year_col': year_col, 'month_col': month_col,
-        'unparseable': int(parsed.isna().sum() - df[date_col].isna().sum()),
-        'first': None if parsed.dropna().empty else str(parsed.min().date()),
-        'last': None if parsed.dropna().empty else str(parsed.max().date()),
-    }
-
-
-# ---- column detectors: they keep the dashboard dropdowns meaningful
-_ID_LIKE = re.compile(r'(?i)(^|[\s_.-])id($|[\s_(.-])')
-
-
-def find_date_columns(df: pd.DataFrame, min_parse: float = 0.9, sample: int = 500) -> list[str]:
-    """Columns that are real dates, or text that is (almost) entirely dates."""
-    found = []
-    for col in df.columns:
-        s = df[col]
-        if pd.api.types.is_datetime64_any_dtype(s):
-            found.append(col)
-        elif _is_texty(s):
-            v = s.dropna().astype(str).str.strip().head(sample)
-            if v.empty or v.str.fullmatch(r'[-+]?\d+(\.\d+)?').mean() > 0.5:
-                continue  # empty, or numbers pretending to be dates
-            if _parse_dates(v).notna().mean() >= min_parse:
-                found.append(col)
-    return found
-
-
-def find_numeric_columns(df: pd.DataFrame, exclude=()) -> list[str]:
-    found = []
-    for col in df.columns:
-        s = df[col]
-        if col in exclude or pd.api.types.is_bool_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
-            continue
-        if pd.api.types.is_numeric_dtype(s):
-            found.append(col)
-        elif _is_texty(s):
-            v = s.dropna().head(500)
-            if len(v) and pd.to_numeric(v, errors='coerce').notna().mean() >= 0.99:
-                found.append(col)
-    return found
-
-
-def find_category_columns(df: pd.DataFrame, exclude=(), min_unique: int = 2, max_unique: int = 50) -> list[str]:
-    """Text columns with a manageable number of distinct values. Identifier columns
-    (names containing 'ID') are skipped: they make poor filters and meaningless charts."""
-    found = []
-    for col in df.columns:
-        if col in exclude or _ID_LIKE.search(str(col)) or not _is_texty(df[col]):
-            continue
-        if min_unique <= df[col].nunique(dropna=True) <= max_unique:
-            found.append(col)
-    return found
-
-
-def suggest_revenue_column(df: pd.DataFrame) -> str | None:
-    numeric = find_numeric_columns(df)
-    for pattern in ('revenue', 'sales', 'amount', 'total'):
-        for col in numeric:
-            if pattern in str(col).lower():
-                return col
+def _classify(df: pd.DataFrame):
+    """Return (table_name, rename_map) if df has the columns of a known table, else None."""
+    normed = {_norm(c): c for c in df.columns}
+    for table in CHECK_ORDER:
+        rename, ok = {}, True
+        for canon, variants in TABLE_SPECS[table].items():
+            hit = next((normed[v] for v in variants if v in normed), None)
+            if hit is None:
+                ok = False
+                break
+            rename[hit] = canon
+        if ok:
+            return table, rename
     return None
 
 
-def suggest_join_keys(left: pd.DataFrame, right: pd.DataFrame, min_overlap: float = 0.5) -> list[dict]:
-    """Rank (left column, right column) pairs that could be a many-to-one key.
-    The right column must be unique. Overlap = share of left rows whose key exists on the right."""
-    def squash(name):
-        return re.sub(r'[^a-z0-9]', '', str(name).lower())
-
-    # iterate by POSITION so a table with repeated column names cannot break this, and skip
-    # any single column that cannot be read rather than failing the whole app
-    right_sets = {}
-    for i, rc in enumerate(right.columns):
-        try:
-            k = _norm_key(right.iloc[:, i]).dropna()
-            if len(k) and k.is_unique:
-                right_sets[rc] = set(k)
-        except Exception:
-            continue
-
-    suggestions = []
-    for i, lc in enumerate(left.columns):
-        try:
-            lk = _norm_key(left.iloc[:, i]).dropna()
-        except Exception:
-            continue
-        if lk.empty:
-            continue
-        for rc, rset in right_sets.items():
-            overlap = float(lk.isin(rset).mean())
-            same_name = squash(lc) == squash(rc)
-            if overlap >= 0.9 or (same_name and overlap >= min_overlap):
-                suggestions.append({'left': lc, 'right': rc, 'overlap': round(overlap, 4),
-                                    '_score': overlap + (0.05 if same_name else 0)})
-    suggestions.sort(key=lambda d: -d['_score'])
-    for d in suggestions:
-        d.pop('_score')
-    return suggestions
+def _find_header(raw: pd.DataFrame):
+    """Find the header row (some exports have a title row above the headers)."""
+    for i in range(min(6, len(raw))):
+        cand = raw.iloc[i + 1 :].copy()
+        cand.columns = [str(c).strip() if pd.notna(c) else f"col{j}" for j, c in enumerate(raw.iloc[i])]
+        found = _classify(cand)
+        if found:
+            return cand.reset_index(drop=True), found
+    return None, None
 
 
-# ---- filters shared by the dashboard (so the dashboard and assistant agree)
-def filter_options(series: pd.Series) -> list:
-    """Sorted distinct values, plus BLANK when some rows are missing this value."""
-    vals = series.dropna().unique().tolist()
+def _read_csv_bytes(data: bytes) -> pd.DataFrame:
     try:
-        vals = sorted(vals)
-    except TypeError:
-        vals = sorted(vals, key=str)
-    if series.isna().any():
-        vals.append(BLANK)
-    return vals
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("cp1252")
+    try:
+        delim = csv.Sniffer().sniff(text[:4096], delimiters=",\t;|").delimiter
+    except csv.Error:
+        delim = ","
+    return pd.read_csv(io.StringIO(text), sep=delim, header=None, dtype=str, keep_default_na=True)
 
 
-def filter_frame(df: pd.DataFrame, selections: dict) -> pd.DataFrame:
-    """Keep rows where each column's value is in the selected list.
-    BLANK in a selection means 'also keep rows where the value is missing', so rows with
-    missing values (for example the Website store has no City) are not silently lost."""
-    mask = pd.Series(True, index=df.index)
-    for col, selected in selections.items():
-        chosen = [v for v in selected if v != BLANK]
-        keep = df[col].isin(chosen)
-        if BLANK in selected:
-            keep = keep | df[col].isna()
-        mask &= keep
-    return df[mask]
+def _read_other(fname: str, data: bytes) -> dict[str, pd.DataFrame]:
+    """
+    Access (.accdb/.mdb), SQLite and similar: delegate to the starter template's loading.py
+    (kept in the repo next to this file). Returns {table label: DataFrame with real headers}.
+    """
+    try:
+        import loading  # starter-template module; not part of this file set
+    except ImportError as exc:
+        raise ValueError(
+            "this file type needs loading.py from the course starter template. "
+            "Alternatively export the tables to CSV or Excel."
+        ) from exc
+    res = loading.load_file(data, fname)
+    return {t.label: t.df for t in res.tables if getattr(t, "usable", True)}
 
 
-# ================================================================ 3. tool contract
+def load_tables(files: list[tuple[str, bytes]]):
+    """
+    Recognise E-Presso tables in a list of (filename, bytes).
+    CSV/TSV/TXT and Excel are read here (a workbook may hold several tables on separate sheets,
+    and a title row above the headers is tolerated). Other formats (Access, SQLite) go through
+    the starter template's loading.py. Returns (tables, messages, unrecognised).
+    """
+    tables: dict[str, pd.DataFrame] = {}
+    messages: list[str] = []
+    unrecognised: list[str] = []
+    for fname, data in files:
+        lower = fname.lower()
+        try:
+            if lower.endswith((".xlsx", ".xlsm", ".xls")):
+                sheets = {k: (v, True) for k, v in pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object).items()}
+            elif lower.endswith((".csv", ".tsv", ".txt")):
+                sheets = {"": (_read_csv_bytes(data), True)}
+            else:
+                sheets = {k: (v, False) for k, v in _read_other(fname, data).items()}
+        except Exception as exc:  # noqa: BLE001 - report any reader failure to the user
+            unrecognised.append(f"{fname} (could not be read: {exc})")
+            continue
+        for sheet, (raw, headerless) in sheets.items():
+            label = f"{fname}" + (f" [{sheet}]" if sheet else "")
+            raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+            if raw.empty:
+                continue
+            if headerless:
+                df, found = _find_header(raw)
+            else:
+                found, df = _classify(raw), raw
+            if not found:
+                unrecognised.append(label)
+                continue
+            table, rename = found
+            df = df.rename(columns=rename)
+            if table in tables:
+                messages.append(f"'{label}' looks like the {table} table, but {table} was already loaded - ignored.")
+                continue
+            tables[table] = df
+            messages.append(f"{label} -> {table} table ({len(df):,} rows)")
+    return tables, messages, unrecognised
+
+
+# --------------------------------------------------------------------------------------
+# 2. PREPARATION
+# --------------------------------------------------------------------------------------
+
+
 @dataclass
-class ToolResult:
-    """Every analytical function returns this. The assistant may only narrate it.
-    Keep `value` to plain Python types (numbers, strings, dicts, lists)."""
-    tool: str
-    value: object
-    definition: str
-    scope: dict
-    rows_used: int
-    caveats: list = field(default_factory=list)
-    error: str | None = None
-
-    def to_dict(self) -> dict:
-        return asdict(self)
+class Dataset:
+    tables: dict[str, pd.DataFrame]  # cleaned source tables (canonical column names)
+    fact: pd.DataFrame  # sales joined to stores / products / categories (one row per sales row)
+    survey: pd.DataFrame  # survey results, one row per store-year
+    notes: list[str] = field(default_factory=list)  # warnings found while preparing
+    reconciliation: list[dict] = field(default_factory=list)  # row/revenue checks after each join
+    source_label: str = ""
 
 
-def _error(tool: str, message: str, scope: dict | None = None) -> ToolResult:
-    return ToolResult(tool=tool, value=None, definition='', scope=scope or {},
-                      rows_used=0, caveats=[], error=message)
+def _to_number(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series.astype(str).str.replace(r"[$,\s]", "", regex=True), errors="coerce")
 
 
-def _apply_filters(df: pd.DataFrame, filters: dict | None):
-    """Validate filters against the LOADED data, then apply them."""
-    for col, wanted in (filters or {}).items():
-        if col not in df.columns:
-            return df, f'Unknown column: {col}'
-        wanted_list = list(wanted) if isinstance(wanted, (list, tuple, set)) else [wanted]
-        valid = set(df[col].dropna().unique())
-        bad = [w for w in wanted_list if w not in valid]
-        if bad:
-            examples = sorted(map(str, valid))[:20]
-            return df, f'{bad} not found in column {col}. Valid values include: {examples}'
-        df = df[df[col].isin(wanted_list)]
-    return df, None
+def _year_from(series: pd.Series) -> pd.Series:
+    """'Y2025' / '2025' / 2025 -> 2025 (Int64)."""
+    digits = series.astype(str).str.extract(r"(\d{4})")[0]
+    return pd.to_numeric(digits, errors="coerce").astype("Int64")
 
 
-def _scope(filters):
-    return {'filters': filters or 'none (all rows)'}
+def _dedupe_lookup(df: pd.DataFrame, key: str, name: str, notes: list[str]) -> pd.DataFrame:
+    dups = int(df[key].duplicated().sum())
+    if dups:
+        notes.append(
+            f"{name}: {dups} duplicate value(s) of key '{key}'. Kept the first row of each so joins cannot duplicate revenue."
+        )
+        df = df.drop_duplicates(subset=key, keep="first")
+    return df
 
 
-# ================================================================ 4. analytical tools
-def get_total(df: pd.DataFrame, value_col: str = 'Revenue', filters: dict | None = None) -> ToolResult:
-    """Sum of one numeric column, optionally filtered."""
-    name = 'get_total'
-    if value_col not in df.columns:
-        return _error(name, f'Unknown column: {value_col}')
-    subset, err = _apply_filters(df, filters)
-    if err:
-        return _error(name, err, {'filters': filters})
-    values = pd.to_numeric(subset[value_col], errors='coerce')
-    n_bad = int(values.isna().sum())
-    caveats = ['This is a sum of the chosen column. Revenue is not profit.']
-    if n_bad:
-        caveats.append(f'{n_bad} row(s) had a missing or non-numeric {value_col} and were excluded.')
-    return ToolResult(tool=name, value=float(values.sum()), definition=f'Sum of {value_col}',
-                      scope=_scope(filters), rows_used=int(values.notna().sum()), caveats=caveats)
-
-
-def group_total(df: pd.DataFrame, value_col: str, group_col: str,
-                filters: dict | None = None) -> ToolResult:
-    """Sum of one numeric column by group (store type, category, year, ...)."""
-    name = 'group_total'
-    for col in (value_col, group_col):
-        if col not in df.columns:
-            return _error(name, f'Unknown column: {col}')
-    subset, err = _apply_filters(df, filters)
-    if err:
-        return _error(name, err, {'filters': filters})
-    work = subset.assign(**{value_col: pd.to_numeric(subset[value_col], errors='coerce')})
-    n_bad = int(work[value_col].isna().sum())
-    n_nogroup = int(work[group_col].isna().sum())
-    valid = work.dropna(subset=[value_col, group_col])
-    grouped = valid.groupby(group_col)[value_col].sum()
-    caveats = ['Sums of the chosen column. Revenue is not profit.']
-    if n_bad:
-        caveats.append(f'{n_bad} row(s) with missing or non-numeric {value_col} were excluded.')
-    if n_nogroup:
-        caveats.append(f'{n_nogroup} row(s) with a missing {group_col} were excluded.')
-    return ToolResult(tool=name, value={str(k): float(v) for k, v in grouped.items()},
-                      definition=f'Sum of {value_col} by {group_col}',
-                      scope=_scope(filters), rows_used=len(valid), caveats=caveats)
-
-
-def monthly_revenue(df: pd.DataFrame, date_col: str, value_col: str = 'Revenue',
-                    filters: dict | None = None) -> ToolResult:
-    """Sum of a value column per calendar month ('YYYY-MM'). Months with no rows are omitted."""
-    name = 'monthly_revenue'
-    for col in (date_col, value_col):
-        if col not in df.columns:
-            return _error(name, f'Unknown column: {col}')
-    subset, err = _apply_filters(df, filters)
-    if err:
-        return _error(name, err, {'filters': filters})
-    work = pd.DataFrame({'d': _parse_dates(subset[date_col]),
-                         'v': pd.to_numeric(subset[value_col], errors='coerce').astype('float64')})
-    n_bad = int(work.isna().any(axis=1).sum())
-    work = work.dropna()
-    monthly = work.groupby(work['d'].dt.to_period('M'))['v'].sum()
-    caveats = ['Months with no matching rows are not shown. Revenue is not profit.']
-    if n_bad:
-        caveats.append(f'{n_bad} row(s) with an invalid date or value were excluded.')
-    return ToolResult(tool=name, value={str(p): float(t) for p, t in monthly.items()},
-                      definition=f'Sum of {value_col} per calendar month of {date_col}',
-                      scope=_scope(filters), rows_used=len(work), caveats=caveats)
-
-
-def top_n(df: pd.DataFrame, value_col: str, group_col: str, n: int = 5,
-          filters: dict | None = None) -> ToolResult:
-    """The n groups with the largest sum of value_col, largest first."""
-    try:
-        n = int(n)
-        if n < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        return _error('top_n', 'n must be a whole number of at least 1')
-    res = group_total(df, value_col, group_col, filters)
-    if res.error:
-        return replace(res, tool='top_n')
-    ranked = dict(sorted(res.value.items(), key=lambda kv: kv[1], reverse=True)[:n])
-    return replace(res, tool='top_n', value=ranked,
-                   definition=f'Top {n} {group_col} by sum of {value_col}')
-
-
-def revenue_share(df: pd.DataFrame, value_col: str, group_col: str,
-                  filters: dict | None = None) -> ToolResult:
-    """Each group's total and its percent of the overall total, largest first."""
-    res = group_total(df, value_col, group_col, filters)
-    if res.error:
-        return replace(res, tool='revenue_share')
-    total = sum(res.value.values())
-    if total == 0:
-        return _error('revenue_share', 'The total is zero, so shares cannot be calculated.', res.scope)
-    value = {k: {'total': v, 'share_pct': round(v / total * 100, 2)}
-             for k, v in sorted(res.value.items(), key=lambda kv: kv[1], reverse=True)}
-    caveats = list(res.caveats)
-    if any(v < 0 for v in res.value.values()):
-        caveats.append('Some groups are negative, so shares can exceed 100% or fall below 0%.')
-    return replace(res, tool='revenue_share', value=value, caveats=caveats,
-                   definition=f'Share of total {value_col} by {group_col} (percent of the groups shown)')
-
-
-def yoy_growth(df: pd.DataFrame, date_col: str, value_col: str = 'Revenue',
-               filters: dict | None = None) -> ToolResult:
-    """Yearly totals and the percent change versus the previous calendar year."""
-    name = 'yoy_growth'
-    for col in (date_col, value_col):
-        if col not in df.columns:
-            return _error(name, f'Unknown column: {col}')
-    subset, err = _apply_filters(df, filters)
-    if err:
-        return _error(name, err, {'filters': filters})
-    work = pd.DataFrame({'d': _parse_dates(subset[date_col]),
-                         'v': pd.to_numeric(subset[value_col], errors='coerce').astype('float64')})
-    n_bad = int(work.isna().any(axis=1).sum())
-    work = work.dropna()
-    value, prev_year, prev_total = {}, None, None
-    for year, part in work.groupby(work['d'].dt.year):
-        total = float(part['v'].sum())
-        comparable = prev_year is not None and year == prev_year + 1 and prev_total
-        growth = round((total - prev_total) / abs(prev_total) * 100, 2) if comparable else None
-        value[str(int(year))] = {'total': total, 'yoy_pct': growth,
-                                 'months_with_data': int(part['d'].dt.to_period('M').nunique())}
-        prev_year, prev_total = year, total
-    caveats = ['Growth compares a year with the one before it. Revenue is not profit.']
-    if any(v['months_with_data'] < 12 for v in value.values()):
-        caveats.append('Some years have fewer than 12 months of data (or a filter removed months), '
-                       'so their totals and growth are not like-for-like.')
-    if n_bad:
-        caveats.append(f'{n_bad} row(s) with an invalid date or value were excluded.')
-    return ToolResult(tool=name, value=value, definition=f'Yearly sum of {value_col} and % change vs prior year',
-                      scope=_scope(filters), rows_used=len(work), caveats=caveats)
-
-
-def data_quality_report(df: pd.DataFrame) -> ToolResult:
-    """Row count, duplicate rows, and missing values per column."""
-    missing = {c: int(n) for c, n in df.isna().sum().items() if n > 0}
-    caveats = []
+def build_dataset(tables: dict[str, pd.DataFrame], source_label: str = "") -> Dataset:
+    """Clean the tables and join the lookups onto Sales. Raises ValueError if required tables are missing."""
+    missing = [t for t in REQUIRED_TABLES if t not in tables]
     if missing:
-        caveats.append('Missing values may limit conclusions drawn from those columns.')
-    return ToolResult(tool='data_quality_report',
-                      value={'rows': len(df), 'duplicate_rows': int(df.duplicated().sum()),
-                             'columns_with_missing': missing},
-                      definition='Counts of duplicate rows and missing values in the loaded table',
-                      scope={'filters': 'none (full table)'}, rows_used=len(df), caveats=caveats)
+        raise ValueError(
+            "Required table(s) not found: " + ", ".join(missing) + ". Upload at least the Sales and Stores tables."
+        )
+    notes: list[str] = []
+    recon: list[dict] = []
+
+    # --- Sales (grain: one row per store x product x month) ---
+    sales = tables["sales"].copy()
+    for col in ["Sales ID", "Store ID", "Category ID", "Product ID"]:
+        sales[col] = sales[col].astype("string").str.strip()
+    raw_rev = sales["Revenue"]
+    sales["Revenue"] = _to_number(raw_rev)
+    bad_rev = int((raw_rev.notna() & sales["Revenue"].isna()).sum())
+    null_rev = int(raw_rev.isna().sum())
+    if bad_rev:
+        notes.append(f"Sales: {bad_rev} Revenue value(s) are not numeric and were treated as missing.")
+    if null_rev:
+        notes.append(f"Sales: {null_rev} row(s) have no Revenue value.")
+    sales["Date"] = pd.to_datetime(sales["Date"], errors="coerce")
+    bad_dates = int(sales["Date"].isna().sum())
+    if bad_dates:
+        lost = float(sales.loc[sales["Date"].isna(), "Revenue"].sum())
+        notes.append(
+            f"Sales: {bad_dates} row(s) have a missing/invalid Date (revenue {lost:,.2f}). "
+            "They count toward total revenue but cannot appear in year/month views."
+        )
+    sales["Year"] = sales["Date"].dt.year.astype("Int64")
+    sales["Month"] = sales["Date"].dt.month.astype("Int64")
+    dup_ids = int(sales["Sales ID"].duplicated().sum())
+    if dup_ids:
+        notes.append(f"Sales: {dup_ids} duplicate Sales ID value(s). Rows were NOT removed - please review.")
+    neg = int((sales["Revenue"] < 0).sum())
+    if neg:
+        notes.append(f"Sales: {neg} row(s) have negative revenue (returns/credits?).")
+
+    base_rows, base_rev = len(sales), float(sales["Revenue"].sum())
+    recon.append({"Step": "Sales as loaded", "Rows": base_rows, "Total revenue": base_rev, "OK": True})
+    fact = sales
+
+    def _check(step: str, df: pd.DataFrame):
+        ok = len(df) == base_rows and math.isclose(float(df["Revenue"].sum()), base_rev, abs_tol=0.005)
+        recon.append({"Step": step, "Rows": len(df), "Total revenue": float(df["Revenue"].sum()), "OK": ok})
+        if not ok:
+            raise ValueError(f"Join '{step}' changed row count or revenue - the relationship is not many-to-one.")
+
+    # --- Stores (many-to-one on Store ID) ---
+    stores = tables["stores"].copy()
+    stores["ID"] = stores["ID"].astype("string").str.strip()
+    stores = _dedupe_lookup(stores, "ID", "Stores", notes)
+    for col in ["Market", "Location", "PostalCode"]:
+        if col not in stores.columns:
+            stores[col] = pd.NA
+    st_cols = stores[["ID", "City", "State", "StoreType", "Market", "Location"]].rename(
+        columns={"ID": "Store ID", "StoreType": "Channel"}
+    )
+    fact = fact.merge(st_cols, on="Store ID", how="left", validate="m:1")
+    _check("+ Stores (Store ID -> ID)", fact)
+    fact["Channel"] = fact["Channel"].fillna("Unknown")
+    has_city = fact["City"].notna() & (fact["City"].astype(str).str.strip() != "")
+    fact["Store"] = np.where(
+        has_city,
+        fact["Store ID"].astype(str) + " - " + fact["City"].astype(str) + ", " + fact["State"].astype(str),
+        fact["Store ID"].astype(str) + " - " + fact["Channel"].astype(str),
+    )
+
+    # --- Categories ---
+    if "categories" in tables:
+        cats = tables["categories"].copy()
+        cats["Category ID"] = cats["Category ID"].astype("string").str.strip()
+        cats = _dedupe_lookup(cats, "Category ID", "Categories", notes)
+        fact = fact.merge(cats[["Category ID", "Category"]], on="Category ID", how="left", validate="m:1")
+        _check("+ Categories (Category ID)", fact)
+    else:
+        notes.append("Categories table not loaded - categories shown by ID.")
+        fact["Category"] = np.nan
+    fact["Category"] = fact["Category"].fillna(fact["Category ID"]).fillna("Unknown")
+
+    # --- Products (names are NOT unique across categories, so always join on Product ID) ---
+    if "products" in tables:
+        prods = tables["products"].copy()
+        prods["Product ID"] = prods["Product ID"].astype("string").str.strip()
+        prods = _dedupe_lookup(prods, "Product ID", "Products", notes)
+        dup_names = int(prods["Product"].duplicated().sum())
+        if dup_names:
+            notes.append(
+                f"Products: {dup_names} product name(s) repeat under different Product IDs. "
+                "Joins use Product ID, and charts label products as 'Name (Category)'."
+            )
+        fact = fact.merge(prods[["Product ID", "Product"]], on="Product ID", how="left", validate="m:1")
+        _check("+ Products (Product ID)", fact)
+    else:
+        notes.append("Products table not loaded - products shown by ID.")
+        fact["Product"] = np.nan
+    fact["Product"] = fact["Product"].fillna(fact["Product ID"]).fillna("Unknown")
+    fact["Product label"] = fact["Product"].astype(str) + " (" + fact["Category"].astype(str) + ")"
+
+    fact = fact[
+        [
+            "Sales ID", "Date", "Year", "Month", "Store ID", "Store", "City", "State", "Market", "Location",
+            "Channel", "Category ID", "Category", "Product ID", "Product", "Product label", "Revenue",
+        ]
+    ].reset_index(drop=True)
+
+    # --- Survey (grain: one row per store x year; kept separate so it can never duplicate revenue) ---
+    if "survey" in tables:
+        sv = tables["survey"].copy()
+        sv["Store ID"] = sv["Store ID"].astype("string").str.strip()
+        sv["Year"] = _year_from(sv["Year"])
+        sv["Satisfaction"] = pd.to_numeric(sv["Satisfaction"], errors="coerce")
+        sv["Interest"] = pd.to_numeric(sv["Interest"], errors="coerce")
+        dups = int(sv.duplicated(subset=["Store ID", "Year"]).sum())
+        if dups:
+            notes.append(f"Survey: {dups} duplicate Store ID + Year row(s). Kept the first of each.")
+            sv = sv.drop_duplicates(subset=["Store ID", "Year"], keep="first")
+        survey = sv[["Store ID", "Year", "Satisfaction", "Interest"]].reset_index(drop=True)
+        miss = int(survey["Satisfaction"].isna().sum())
+        if miss:
+            notes.append(
+                f"Survey: {miss} store-year row(s) have no Satisfaction score "
+                "(e.g. the website has no survey), which limits satisfaction conclusions."
+            )
+    else:
+        survey = pd.DataFrame(columns=["Store ID", "Year", "Satisfaction", "Interest"])
+        notes.append("Survey table not loaded - satisfaction analysis unavailable.")
+
+    return Dataset(tables=tables, fact=fact, survey=survey, notes=notes, reconciliation=recon, source_label=source_label)
 
 
-# ------------------------------------------------------------ merge check (legacy helper)
-def check_merge(left: pd.DataFrame, right: pd.DataFrame, on, value_col: str, how: str = 'left'):
-    """Merge, and report whether the join changed the row count or the revenue sum.
-    Prefer join_tables(), which also refuses unsafe joins. Returns (merged, report)."""
-    before_rows = len(left)
-    before_sum = float(pd.to_numeric(left[value_col], errors='coerce').sum())
-    merged = left.merge(right, on=on, how=how)
-    after_rows = len(merged)
-    after_sum = float(pd.to_numeric(merged[value_col], errors='coerce').sum())
-    fan_out = after_rows > before_rows or abs(after_sum - before_sum) > 1e-9
-    report = {
-        'rows_before': before_rows, 'rows_after': after_rows,
-        'sum_before': before_sum, 'sum_after': after_sum,
-        'changed': fan_out,
-        'warning': ('The join changed the row count or the total. Check the grain and keys '
-                    'of both tables before using this result.') if fan_out else '',
+# --------------------------------------------------------------------------------------
+# 3. PROFILING
+# --------------------------------------------------------------------------------------
+
+
+def profile_dataset(ds: Dataset) -> dict:
+    """Everything the 'Data profile' page shows. All values are computed from the loaded tables."""
+    summary, missing_rows = [], []
+    for name in CHECK_ORDER:
+        if name not in ds.tables:
+            continue
+        df = ds.tables[name]
+        key = KEYS[name]
+        summary.append(
+            {
+                "Table": name,
+                "Rows": len(df),
+                "Columns": df.shape[1],
+                "Missing cells": int(df.isna().sum().sum()),
+                "Duplicate rows": int(df.duplicated().sum()),
+                f"Duplicate key values": int(df[key[0]].duplicated().sum()),
+            }
+        )
+        for col in df.columns:
+            n = int(df[col].isna().sum())
+            if n:
+                missing_rows.append({"Table": name, "Column": col, "Missing": n, "% of rows": round(100 * n / len(df), 1)})
+
+    t = ds.tables
+    rels = []
+
+    def _rel(child, ccol, parent, pcol):
+        if child in t and parent in t:
+            cvals = set(t[child][ccol].dropna().astype(str).str.strip())
+            pvals = set(t[parent][pcol].dropna().astype(str).str.strip())
+            rels.append(
+                {
+                    "Child": f"{child}.{ccol}",
+                    "Parent": f"{parent}.{pcol}",
+                    "Declared": "many-to-one",
+                    "Parent key unique?": bool(t[parent][pcol].dropna().is_unique),
+                    "Orphan values (child with no parent)": len(cvals - pvals),
+                }
+            )
+
+    _rel("sales", "Store ID", "stores", "ID")
+    _rel("sales", "Product ID", "products", "Product ID")
+    _rel("sales", "Category ID", "categories", "Category ID")
+    _rel("survey", "Store ID", "stores", "ID")
+    if "survey" in t:
+        sales_sy = ds.fact.dropna(subset=["Year"])[["Store ID", "Year"]].drop_duplicates()
+        merged = sales_sy.merge(ds.survey[["Store ID", "Year"]], how="left", on=["Store ID", "Year"], indicator=True)
+        rels.append(
+            {
+                "Child": "sales (Store ID + Year)",
+                "Parent": "survey (Store ID + Year)",
+                "Declared": "many-to-one",
+                "Parent key unique?": bool(not ds.survey.duplicated(subset=["Store ID", "Year"]).any()),
+                "Orphan values (child with no parent)": int((merged["_merge"] == "left_only").sum()),
+            }
+        )
+
+    f = ds.fact
+    grain_dups = int(f.duplicated(subset=["Store ID", "Product ID", "Year", "Month"]).sum())
+    cat_per_prod = int((f.groupby("Product ID")["Category ID"].nunique() > 1).sum())
+    months_per_sy = f.dropna(subset=["Year"]).groupby(["Store ID", "Year"])["Month"].nunique()
+    incomplete = int((months_per_sy < 12).sum())
+
+    prod_names_dup = 0
+    if "products" in t:
+        prod_names_dup = int(t["products"]["Product"].duplicated().sum())
+
+    grain = [
+        {
+            "Table": "sales",
+            "Grain (one row = ...)": "one product's revenue at one location (store or website) in one month",
+            "Checked in the data": f"{grain_dups} duplicate Store+Product+Month combinations; "
+            f"{cat_per_prod} products appear under more than one category",
+        },
+        {
+            "Table": "stores",
+            "Grain (one row = ...)": "one sales location (a physical store or the website)",
+            "Checked in the data": f"{len(ds.tables['stores']):,} locations; key 'ID' unique: "
+            f"{ds.tables['stores']['ID'].is_unique}",
+        },
+    ]
+    if "products" in t:
+        grain.append(
+            {
+                "Table": "products",
+                "Grain (one row = ...)": "one product (identified by Product ID, not by name)",
+                "Checked in the data": f"{len(t['products']):,} products; {prod_names_dup} repeated product names",
+            }
+        )
+    if "categories" in t:
+        grain.append(
+            {
+                "Table": "categories",
+                "Grain (one row = ...)": "one product category",
+                "Checked in the data": f"{len(t['categories']):,} categories",
+            }
+        )
+    if "survey" in t:
+        grain.append(
+            {
+                "Table": "survey",
+                "Grain (one row = ...)": "one location's survey result for one year (NOT per sale)",
+                "Checked in the data": f"{len(ds.survey):,} location-years; duplicate Store+Year: "
+                f"{int(ds.survey.duplicated(subset=['Store ID', 'Year']).sum())}",
+            }
+        )
+
+    checks = {
+        "Duplicate Sales IDs": int(ds.fact["Sales ID"].duplicated().sum()),
+        "Rows with missing Revenue": int(ds.fact["Revenue"].isna().sum()),
+        "Rows with negative Revenue": int((ds.fact["Revenue"] < 0).sum()),
+        "Rows with zero Revenue": int((ds.fact["Revenue"] == 0).sum()),
+        "Rows with missing/invalid Date": int(ds.fact["Date"].isna().sum()),
+        "Store-years with fewer than 12 months of sales": incomplete,
+        "Unknown channel rows (store not in Stores table)": int((ds.fact["Channel"] == "Unknown").sum()),
     }
-    return merged, report
+    return {
+        "summary": pd.DataFrame(summary),
+        "missing": pd.DataFrame(missing_rows, columns=["Table", "Column", "Missing", "% of rows"]),
+        "relationships": pd.DataFrame(rels),
+        "grain": pd.DataFrame(grain),
+        "checks": checks,
+        "reconciliation": pd.DataFrame(ds.reconciliation),
+        "notes": ds.notes,
+    }
+
+
+# --------------------------------------------------------------------------------------
+# 4. CORE METRICS (shared by the dashboard and the assistant, so they always agree)
+# --------------------------------------------------------------------------------------
+
+
+def filter_fact(fact, years=None, channels=None, categories=None, stores=None) -> pd.DataFrame:
+    """Dashboard filters. None means 'no filter'; an empty list means 'nothing selected' (no rows)."""
+    mask = pd.Series(True, index=fact.index)
+    if years is not None:
+        mask &= fact["Year"].isin(list(years))
+    if channels is not None:
+        mask &= fact["Channel"].isin(list(channels))
+    if categories is not None:
+        mask &= fact["Category"].isin(list(categories))
+    if stores is not None:
+        mask &= fact["Store"].isin(list(stores))
+    return fact[mask]
+
+
+def total_revenue(fact) -> float:
+    return float(fact["Revenue"].sum())
+
+
+def revenue_by_year(fact, by: str | None = None) -> pd.DataFrame:
+    d = fact.dropna(subset=["Year"])
+    cols = ["Year"] + ([by] if by else [])
+    out = d.groupby(cols, as_index=False)["Revenue"].sum()
+    out["Year"] = out["Year"].astype(int)
+    return out.sort_values(cols).reset_index(drop=True)
+
+
+def revenue_by_month(fact) -> pd.DataFrame:
+    d = fact.dropna(subset=["Year", "Month"])
+    out = d.groupby(["Year", "Month"], as_index=False)["Revenue"].sum()
+    out["Year"] = out["Year"].astype(int)
+    out["Month"] = out["Month"].astype(int)
+    out["Month name"] = out["Month"].map(lambda m: MONTH_NAMES[m - 1])
+    return out.sort_values(["Year", "Month"]).reset_index(drop=True)
+
+
+def monthly_share(fact) -> pd.DataFrame:
+    """Monthly revenue as % of the SAME calendar year's revenue (same filters)."""
+    m = revenue_by_month(fact)
+    year_total = m.groupby("Year")["Revenue"].transform("sum")
+    m["Share of year %"] = np.where(year_total != 0, 100 * m["Revenue"] / year_total, np.nan)
+    return m
+
+
+def revenue_by(fact, dim: str) -> pd.DataFrame:
+    out = fact.groupby(dim, as_index=False)["Revenue"].sum().sort_values("Revenue", ascending=False)
+    tot = out["Revenue"].sum()
+    out["Share %"] = np.where(tot != 0, 100 * out["Revenue"] / tot, np.nan)
+    return out.reset_index(drop=True)
+
+
+def period_label(fact) -> str:
+    d = fact["Date"].dropna()
+    if d.empty:
+        return "no dated rows"
+    return f"{d.min():%b %Y} - {d.max():%b %Y}"
+
+
+def months_present(fact, year: int) -> int:
+    return int(fact.loc[fact["Year"] == year, "Month"].nunique())
+
+
+def describe_filters(years, channels, categories, stores, fact_all) -> str:
+    """Human-readable description of which filters are active (for chart titles / labels)."""
+    parts = []
+
+    def _desc(label, chosen, universe):
+        if chosen is None or set(chosen) == set(universe):
+            return f"all {label}"
+        return f"{label}: " + ", ".join(map(str, chosen)) if chosen else f"no {label}"
+
+    parts.append(_desc("years", sorted(years) if years is not None else None, sorted(fact_all["Year"].dropna().unique())))
+    parts.append(_desc("channels", channels, fact_all["Channel"].unique()))
+    parts.append(_desc("categories", categories, fact_all["Category"].unique()))
+    parts.append(_desc("stores", stores, fact_all["Store"].unique()))
+    return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------------------
+# 5. TOOLS - the only functions the assistant may call
+# --------------------------------------------------------------------------------------
+# Each tool: takes the data (and simple, validated arguments), returns a JSON-safe dict.
+# They never modify data and never execute model-written code.
+
+_SYNONYMS = {
+    "online": "website", "web": "website", "ecommerce": "website", "e-commerce": "website",
+    "physical": "brick & mortar", "retail": "brick & mortar", "in-store": "brick & mortar",
+    "brick and mortar": "brick & mortar", "brick-and-mortar": "brick & mortar", "stores": "brick & mortar",
+    "store": "brick & mortar",
+}
+
+
+def _clean(obj):
+    """Make results JSON-safe: numpy -> python, NaN -> None, Timestamp -> str."""
+    if isinstance(obj, dict):
+        return {str(k): _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        v = float(obj)
+        return None if (math.isnan(v) or math.isinf(v)) else round(v, 4)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, pd.Timestamp):
+        return obj.strftime("%Y-%m-%d")
+    if obj is pd.NA or obj is pd.NaT:
+        return None
+    return obj
+
+
+def _records(df: pd.DataFrame) -> list[dict]:
+    return _clean(df.to_dict(orient="records"))
+
+
+def _match_option(value, options, what: str):
+    """Case-insensitive match of a user value to the options in the data. Returns (match, error)."""
+    options = [str(o) for o in options]
+    low = str(value).strip().lower()
+    low = _SYNONYMS.get(low, low)
+    exact = [o for o in options if o.lower() == low]
+    if exact:
+        return exact[0], None
+    part = [o for o in options if low and low in o.lower()]
+    if len(part) == 1:
+        return part[0], None
+    return None, {"error": f"Unknown {what} '{value}'.", "valid_values": sorted(options)}
+
+
+def _match_store(fact, value):
+    """Match by Store ID, city or label. Returns (list_of_store_ids, error)."""
+    low = str(value).strip().lower()
+    stores = fact[["Store ID", "Store", "City"]].drop_duplicates()
+    ids = stores[stores["Store ID"].astype(str).str.lower() == low]["Store ID"].tolist()
+    if not ids:
+        ids = stores[stores["City"].astype(str).str.lower() == low]["Store ID"].tolist()
+    if not ids:
+        ids = stores[stores["Store"].astype(str).str.lower().str.contains(re.escape(low))]["Store ID"].tolist()
+    if not ids:
+        return None, {"error": f"Unknown store '{value}'.", "valid_values": sorted(stores["Store"].astype(str).unique())}
+    if len(ids) > 1:
+        labels = stores[stores["Store ID"].isin(ids)]["Store"].tolist()
+        return None, {
+            "error": f"'{value}' matches more than one store ({', '.join(labels)}). Please specify the Store ID.",
+            "valid_values": sorted(labels),
+        }
+    return ids[0], None
+
+
+def _subset(fact, year=None, channel=None, category=None, store=None):
+    """Apply single-value filters. Returns (subset, applied_filters, error_or_None)."""
+    applied = {}
+    d = fact
+    if year is not None:
+        years = sorted(int(y) for y in fact["Year"].dropna().unique())
+        if int(year) not in years:
+            return d, applied, {"error": f"Year {year} is not in the loaded data.", "valid_values": years}
+        d = d[d["Year"] == int(year)]
+        applied["year"] = int(year)
+    if channel is not None:
+        ch, err = _match_option(channel, fact["Channel"].unique(), "channel")
+        if err:
+            return d, applied, err
+        d = d[d["Channel"] == ch]
+        applied["channel"] = ch
+    if category is not None:
+        ca, err = _match_option(category, fact["Category"].unique(), "category")
+        if err:
+            return d, applied, err
+        d = d[d["Category"] == ca]
+        applied["category"] = ca
+    if store is not None:
+        sid, err = _match_store(fact, store)
+        if err:
+            return d, applied, err
+        d = d[d["Store ID"] == sid]
+        applied["store"] = d["Store"].iloc[0] if len(d) else sid
+    return d, applied, None
+
+
+def _pct_change(old, new):
+    if old is None or new is None or old == 0 or pd.isna(old) or pd.isna(new):
+        return None
+    return 100 * (new - old) / old
+
+
+def _partial_year_notes(fact, years) -> list[str]:
+    out = []
+    for y in years:
+        n = months_present(fact, int(y))
+        if n < 12:
+            out.append(f"{int(y)} has only {n} month(s) of data, so comparisons involving it are not like-for-like.")
+    return out
+
+
+def get_total_revenue(fact, year=None, channel=None, category=None, store=None) -> dict:
+    """Total revenue for the data, optionally narrowed by year / channel / category / store."""
+    d, applied, err = _subset(fact, year, channel, category, store)
+    if err:
+        return err
+    out = {
+        "total_revenue": round(total_revenue(d), 2),
+        "rows_summed": int(len(d)),
+        "filters_applied": applied or "none",
+        "period_covered": period_label(d),
+    }
+    if len(d) == 0:
+        out["note"] = "No rows match these filters."
+    nulls = int(d["Revenue"].isna().sum())
+    if nulls:
+        out["warning"] = f"{nulls} row(s) have missing revenue and were not counted."
+    return _clean(out)
+
+
+def get_revenue_by_year(fact, channel=None, category=None, store=None) -> dict:
+    """Revenue for each calendar year with year-over-year change."""
+    d, applied, err = _subset(fact, None, channel, category, store)
+    if err:
+        return err
+    t = revenue_by_year(d)
+    if t.empty:
+        return {"note": "No dated revenue rows match.", "filters_applied": applied or "none"}
+    t["Months of data"] = t["Year"].map(lambda y: months_present(d, y))
+    t["YoY change"] = t["Revenue"].diff()
+    t["YoY change %"] = t["Revenue"].pct_change() * 100
+    notes = _partial_year_notes(d, t["Year"])
+    return _clean(
+        {
+            "by_year": _records(t.rename(columns={"Revenue": "revenue"})),
+            "total_revenue": round(float(t["Revenue"].sum()), 2),
+            "filters_applied": applied or "none",
+            "notes": notes,
+        }
+    )
+
+
+def get_revenue_by_channel(fact, year=None, category=None) -> dict:
+    """Revenue split by sales channel (e.g. Website vs Brick & Mortar), with growth between first and last year."""
+    d, applied, err = _subset(fact, year, None, category, None)
+    if err:
+        return err
+    if d.empty:
+        return {"note": "No rows match.", "filters_applied": applied or "none"}
+    by_ch = revenue_by(d, "Channel").rename(columns={"Channel": "channel", "Revenue": "revenue", "Share %": "share_pct"})
+    result = {"by_channel": _records(by_ch), "filters_applied": applied or "none", "notes": []}
+    yc = revenue_by_year(d, "Channel")
+    result["by_year_and_channel"] = _records(yc.rename(columns={"Channel": "channel", "Revenue": "revenue"}))
+    years = sorted(yc["Year"].unique())
+    if len(years) >= 2:
+        first, last = years[0], years[-1]
+        piv = yc.pivot(index="Channel", columns="Year", values="Revenue").fillna(0.0)
+        growth = []
+        for ch in piv.index:
+            a, b = float(piv.loc[ch, first]), float(piv.loc[ch, last])
+            growth.append(
+                {"channel": ch, "first_year": int(first), "last_year": int(last), "revenue_first_year": a,
+                 "revenue_last_year": b, "change": b - a, "pct_change": _pct_change(a, b)}
+            )
+        growth.sort(key=lambda r: r["change"], reverse=True)
+        result["growth_first_to_last_year"] = growth
+        result["greatest_absolute_growth"] = growth[0]["channel"]
+        pct_ok = [g for g in growth if g["pct_change"] is not None]
+        if pct_ok:
+            result["greatest_pct_growth"] = max(pct_ok, key=lambda g: g["pct_change"])["channel"]
+        result["notes"] += _partial_year_notes(d, [first, last])
+        result["notes"].append("'Growth' can mean dollars or percent; both are shown and they can name different channels.")
+    return _clean(result)
+
+
+def get_monthly_revenue_share(fact, year=None, channel=None, category=None, store=None) -> dict:
+    """Each month's revenue as a % of its own calendar year's revenue, plus the average share per month."""
+    d, applied, err = _subset(fact, year, channel, category, store)
+    if err:
+        return err
+    ms = monthly_share(d)
+    if ms.empty:
+        return {"note": "No dated revenue rows match.", "filters_applied": applied or "none"}
+    full_years = [y for y in ms["Year"].unique() if months_present(d, y) == 12]
+    avg = None
+    if full_years:
+        avg = (
+            ms[ms["Year"].isin(full_years)].groupby(["Month", "Month name"], as_index=False)["Share of year %"].mean()
+            .rename(columns={"Share of year %": "average_share_pct"})
+        )
+    out = {
+        "monthly": _records(ms.rename(columns={"Revenue": "revenue", "Share of year %": "share_of_year_pct"})),
+        "denominator": "that calendar year's total revenue within the same filters",
+        "filters_applied": applied or "none",
+        "notes": _partial_year_notes(d, ms["Year"].unique()),
+    }
+    if avg is not None:
+        out["average_share_by_month"] = _records(avg)
+        out["peak_month"] = avg.loc[avg["average_share_pct"].idxmax(), "Month name"]
+        out["lowest_month"] = avg.loc[avg["average_share_pct"].idxmin(), "Month name"]
+        out["years_used_for_average"] = [int(y) for y in full_years]
+    return _clean(out)
+
+
+def _store_year_revenue(d: pd.DataFrame) -> pd.DataFrame:
+    return d.dropna(subset=["Year"]).groupby(["Store ID", "Store", "Channel", "Year"], as_index=False)["Revenue"].sum()
+
+
+def get_store_trend(fact, start_year=None, end_year=None, channel=None, category=None, top_n=None) -> dict:
+    """Revenue change per location between two years (default: first and last year in the data)."""
+    d, applied, err = _subset(fact, None, channel, category, None)
+    if err:
+        return err
+    sy = _store_year_revenue(d)
+    if sy.empty:
+        return {"note": "No dated revenue rows match.", "filters_applied": applied or "none"}
+    years = sorted(int(y) for y in sy["Year"].unique())
+    start = int(start_year) if start_year is not None else years[0]
+    end = int(end_year) if end_year is not None else years[-1]
+    for y in (start, end):
+        if y not in years:
+            return {"error": f"Year {y} is not in the loaded data.", "valid_values": years}
+    if start == end:
+        return {"error": "start_year and end_year must differ.", "valid_values": years}
+    a = sy[sy["Year"] == start].set_index("Store ID")["Revenue"]
+    b = sy[sy["Year"] == end].set_index("Store ID")["Revenue"]
+    meta = sy.drop_duplicates("Store ID").set_index("Store ID")[["Store", "Channel"]]
+    rows = []
+    for sid in meta.index:
+        ra, rb = float(a.get(sid, 0.0)), float(b.get(sid, 0.0))
+        rows.append(
+            {"store_id": sid, "store": meta.loc[sid, "Store"], "channel": meta.loc[sid, "Channel"],
+             "revenue_start": ra, "revenue_end": rb, "change": rb - ra, "pct_change": _pct_change(ra, rb)}
+        )
+    rows.sort(key=lambda r: (r["pct_change"] is None, -(r["pct_change"] or 0)))
+    declined = [r for r in rows if r["change"] < 0]
+    comparable = [r for r in rows if r["pct_change"] is not None]
+    out = {
+        "start_year": start, "end_year": end,
+        "filters_applied": applied or "none",
+        "stores": rows[: int(top_n)] if top_n else rows,
+        "stores_compared": len(rows),
+        "stores_that_declined": len(declined),
+        "largest_pct_decline": min(declined, key=lambda r: r["pct_change"] if r["pct_change"] is not None else 0)
+        if any(r["pct_change"] is not None for r in declined) else None,
+        "largest_pct_growth": max(comparable, key=lambda r: r["pct_change"]) if comparable else None,
+        "notes": _partial_year_notes(d, [start, end]),
+    }
+    if not declined:
+        out["notes"].append("No location declined between these years.")
+    no_start = [r["store"] for r in rows if r["revenue_start"] == 0]
+    if no_start:
+        out["notes"].append(
+            "No revenue in the start year (opened later or missing data), so % change is undefined: " + ", ".join(no_start)
+        )
+    return _clean(out)
+
+
+def get_store_ranking(fact, year=None, channel=None, category=None, top_n=None) -> dict:
+    """Locations ranked by revenue (optionally for one year)."""
+    d, applied, err = _subset(fact, year, channel, category, None)
+    if err:
+        return err
+    if d.empty:
+        return {"note": "No rows match.", "filters_applied": applied or "none"}
+    r = revenue_by(d, "Store").rename(columns={"Store": "store", "Revenue": "revenue", "Share %": "share_pct"})
+    r["rank"] = range(1, len(r) + 1)
+    if top_n:
+        r = r.head(int(top_n))
+    return _clean({"ranking": _records(r), "filters_applied": applied or "none", "period_covered": period_label(d)})
+
+
+def get_category_performance(fact, year=None, channel=None, store=None, level="category") -> dict:
+    """Revenue by product category (or by individual product with level='product'), with growth first->last year."""
+    d, applied, err = _subset(fact, year, channel, None, store)
+    if err:
+        return err
+    if d.empty:
+        return {"note": "No rows match.", "filters_applied": applied or "none"}
+    dim = "Product label" if str(level).lower() == "product" else "Category"
+    r = revenue_by(d, dim).rename(columns={dim: "name", "Revenue": "revenue", "Share %": "share_pct"})
+    out = {"level": dim, "performance": _records(r), "filters_applied": applied or "none", "notes": []}
+    yc = revenue_by_year(d, dim)
+    years = sorted(yc["Year"].unique())
+    if len(years) >= 2:
+        first, last = years[0], years[-1]
+        piv = yc.pivot(index=dim, columns="Year", values="Revenue").fillna(0.0)
+        growth = [
+            {"name": n, "first_year": int(first), "last_year": int(last), "revenue_first_year": float(piv.loc[n, first]),
+             "revenue_last_year": float(piv.loc[n, last]), "change": float(piv.loc[n, last] - piv.loc[n, first]),
+             "pct_change": _pct_change(float(piv.loc[n, first]), float(piv.loc[n, last]))}
+            for n in piv.index
+        ]
+        growth.sort(key=lambda g: g["change"], reverse=True)
+        out["growth_first_to_last_year"] = growth
+        out["notes"] += _partial_year_notes(d, [first, last])
+    return _clean(out)
+
+
+def get_satisfaction_vs_revenue(fact, survey) -> dict:
+    """
+    Association between survey Satisfaction/Interest and annual revenue across location-years.
+    This is correlation only - it cannot show that satisfaction causes revenue (or the reverse).
+    """
+    sy = fact.dropna(subset=["Year"]).groupby(["Store ID", "Year"], as_index=False)["Revenue"].sum()
+    if sy.empty:
+        return {"note": "No dated revenue rows."}
+    m = sy.merge(survey, on=["Store ID", "Year"], how="left")
+    with_sat = m.dropna(subset=["Satisfaction"])
+    missing = m[m["Satisfaction"].isna()]
+    out = {
+        "location_years_in_scope": int(len(m)),
+        "location_years_with_satisfaction": int(len(with_sat)),
+        "location_years_missing_satisfaction": int(len(missing)),
+        "locations_missing_all_satisfaction": sorted(
+            set(missing["Store ID"]) - set(with_sat["Store ID"])
+        ),
+        "caveats": [
+            "Correlation is not causation: stores differ in size, market and location, and revenue can influence "
+            "satisfaction as easily as the reverse.",
+            "Survey scale, sample sizes and response rates are not in the data.",
+            "Locations without survey responses (such as the website) are excluded from the correlation.",
+            "Large stores (high revenue) and small stores may differ systematically, which can drive the pattern.",
+        ],
+    }
+    if len(with_sat) >= 3:
+        out["pearson_correlation_satisfaction_vs_revenue"] = float(with_sat["Satisfaction"].corr(with_sat["Revenue"]))
+        out["spearman_rank_correlation_satisfaction_vs_revenue"] = float(
+            with_sat["Satisfaction"].rank().corr(with_sat["Revenue"].rank())
+        )
+        inter = m.dropna(subset=["Interest"])
+        if len(inter) >= 3:
+            out["pearson_correlation_interest_vs_revenue"] = float(inter["Interest"].corr(inter["Revenue"]))
+    else:
+        out["note"] = "Too few location-years with satisfaction scores to compute a correlation."
+    return _clean(out)
+
+
+def get_data_quality_report(ds: Dataset) -> dict:
+    """Missing values, duplicates, orphan keys and other potential data problems in the loaded data."""
+    p = profile_dataset(ds)
+    return _clean(
+        {
+            "table_summary": _records(p["summary"]),
+            "missing_values": _records(p["missing"]),
+            "relationship_checks": _records(p["relationships"]),
+            "other_checks": p["checks"],
+            "join_reconciliation": _records(p["reconciliation"]),
+            "warnings": p["notes"],
+        }
+    )
+
+
+def get_data_limitations(ds: Dataset) -> dict:
+    """What the loaded data can and cannot support (e.g. whether profit can be computed)."""
+    cols = {name: [str(c) for c in df.columns] for name, df in ds.tables.items()}
+    cost_words = ("cost", "profit", "margin", "expense", "cogs", "price", "quantity", "units", "rent", "lease", "wage")
+    cost_like = sorted(f"{t}.{c}" for t, cs in cols.items() for c in cs if any(w in c.lower() for w in cost_words))
+    return _clean(
+        {
+            "columns_by_table": cols,
+            "cost_or_profit_like_columns_found": cost_like or "none",
+            "measure_available": "Revenue (a stored dollar amount per store/product/month)",
+            "not_available": [
+                "costs, expenses, operating or lease costs, margins or profit (revenue is NOT profit)",
+                "units sold or prices (revenue cannot be split into quantity x price)",
+                "customer-level data (survey is per location per year, not per customer)",
+                "survey response counts or scale definition",
+                "reasons for changes (the data cannot establish causes)",
+            ],
+            "profit_tool_available": False,
+        }
+    )

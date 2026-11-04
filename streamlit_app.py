@@ -1,404 +1,463 @@
-"""Main app.
-Flow: upload files -> profile -> MODEL (join tables, define revenue, pick the date) ->
-DASHBOARD (revenue KPIs, filters, charts) -> ASSISTANT.
+"""
+E-Presso BI Analyst - Streamlit application.
 
-Keep calculations in analytics.py, file reading in loading.py, and the assistant in agent.py.
-The dashboard calls the SAME functions as the assistant, so what you validate against
-Power BI is exactly what the assistant will later report."""
-import calendar
+Tabs: Dashboard | Data profile & model | Validation | Assistant | About
+All numbers are calculated from the data currently loaded (bundled sample or your upload);
+nothing is hardcoded. The dashboard and the assistant call the same functions in analytics.py.
+"""
+from __future__ import annotations
+
+import os
 import re
 import traceback
+from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 import agent
-import analytics
-import loading
+import analytics as A
 
-MAX_QUESTIONS = 15  # per-session limit for the assistant
+DATA_DIR = Path(__file__).parent / "data"
+DEFAULT_MAX_QUESTIONS = 15
+MAX_QUESTION_CHARS = 500
 
-st.set_page_config(page_title='E-Presso BI Analyst', layout='wide')
-st.title('E-Presso BI Analyst')
-st.caption('Upload your sales, store, product and survey files, build the data model, '
-           'then explore revenue with filters.')
+st.set_page_config(page_title="E-Presso BI Analyst", page_icon="☕", layout="wide")
 
 
-@st.cache_data(show_spinner='Reading file...')
-def cached_load(file_bytes: bytes, filename: str):
-    # Cached per FILE and keyed on its contents: adding a second file never re-reads the
-    # first, and an edited file is never confused with the original.
-    return loading.load_file(file_bytes, filename)
-
-
-def money(x) -> str:
-    return f'{x:,.2f}'
-
-
-# ---------------------------------------------------------------- 1. upload
-with st.sidebar:
-    st.header('Data')
-    uploads = st.file_uploader(
-        'Upload one or more files',
-        type=loading.SUPPORTED_TYPES,
-        accept_multiple_files=True,
-        help='CSV / TXT / TSV, Excel, Access (.accdb, .mdb) or SQLite. '
-             'Files with several sheets or tables are split into separate tables.',
-    )
-
-if not uploads:
-    st.info('Upload one or more files in the sidebar to begin.')
-    st.stop()
-
-# ---------------------------------------------------------------- 2. read every file
-loaded: dict[str, loading.LoadedTable] = {}
-for f in uploads:
+# ------------------------------------------------------------------ helpers
+def get_secret(name: str, default=None):
+    """Streamlit secrets first, then environment variables. Never printed or logged."""
     try:
-        result = cached_load(f.getvalue(), f.name)
-    except loading.LoadError as exc:  # one bad file must not block the others
-        st.error(f'Could not read {f.name}: {exc}')
-        continue
-    for warning in result.warnings:
-        st.warning(f'{f.name}: {warning}')
-    for table in result.tables:
-        label, n = table.label, 2
-        while label in loaded:  # the same file uploaded twice
-            label, n = f'{table.label} ({n})', n + 1
-        loaded[label] = table
+        return st.secrets[name]
+    except Exception:  # noqa: BLE001 - no secrets file / missing key
+        return os.environ.get(name, default)
 
-usable = {label: t for label, t in loaded.items() if t.usable}
-if not usable:
-    st.error('No readable tables were found in the uploaded files.')
+
+def money(x, cents=False) -> str:
+    if x is None or pd.isna(x):
+        return "n/a"
+    s = f"${abs(x):,.2f}" if cents else f"${abs(x):,.0f}"
+    return f"-{s}" if x < 0 else s
+
+
+@st.cache_data(show_spinner=False)
+def bundled_files():
+    keep = {".csv", ".tsv", ".txt", ".xlsx"}
+    return tuple((p.name, p.read_bytes()) for p in sorted(DATA_DIR.glob("*")) if p.suffix.lower() in keep)
+
+
+@st.cache_data(show_spinner="Reading and checking the data...")
+def build_from_files(upload_files: tuple, fill_from_bundled: bool):
+    """Load uploaded files (or the bundled data), build the model, return (dataset, messages, unrecognised)."""
+    if upload_files:
+        tables, messages, unrecognised = A.load_tables(list(upload_files))
+        label = "Uploaded: " + ", ".join(n for n, _ in upload_files)
+        if fill_from_bundled:
+            bundled, _, _ = A.load_tables(list(bundled_files()))
+            for name, df in bundled.items():
+                if name not in tables:
+                    tables[name] = df
+                    messages.append(f"{name} table was not in your upload, so the bundled {name} table is used.")
+                    label += f" (+ bundled {name})"
+    else:
+        tables, messages, unrecognised = A.load_tables(list(bundled_files()))
+        label = "Bundled E-Presso sample data"
+    return A.build_dataset(tables, label), messages, unrecognised
+
+
+@st.cache_resource(show_spinner=False)
+def get_client(api_key: str):
+    return agent.make_client(api_key)
+
+
+def data_fingerprint(fact) -> str:
+    return f"{len(fact):,} sales rows, total revenue {money(A.total_revenue(fact), cents=True)}"
+
+
+# ------------------------------------------------------------------ sidebar: data
+st.title("☕ E-Presso BI Analyst")
+st.caption("Interactive revenue analysis with data checks, validation tools and an analytical assistant.")
+
+with st.sidebar:
+    st.header("Data")
+    uploads = st.file_uploader(
+        "Upload an updated dataset (optional)",
+        type=["csv", "tsv", "txt", "xlsx", "xls", "accdb", "mdb"],
+        accept_multiple_files=True,
+        help="Upload Sales, Stores, Products, Categories and Survey files (CSV or Excel; Access needs loading.py). "
+        "Tables are recognised by their columns, not file names. Uploaded files replace the bundled data.",
+    )
+    fill = st.checkbox("Use bundled data for any table I don't upload", value=True)
+    if uploads:
+        st.caption("Using your uploaded data. Remove the files to return to the bundled data.")
+    else:
+        st.caption("Using the bundled E-Presso sample data.")
+
+try:
+    ds, load_messages, unrecognised = build_from_files(tuple((f.name, f.getvalue()) for f in uploads), fill)
+except ValueError as exc:
+    st.error(f"The data could not be prepared: {exc}")
+    st.stop()
+except Exception as exc:  # noqa: BLE001
+    st.error(f"Unexpected error while loading data: {type(exc).__name__}: {exc}")
+    st.code(traceback.format_exc())
     st.stop()
 
+for u in unrecognised:
+    st.warning(f"Could not recognise a table in: {u}")
 
-# ---------------------------------------------------------------- 3. model tab
-def render_model_tab(usable: dict):
-    """Build the analysis table from the loaded tables. Returns a dict (the model) or None.
-    No st.stop() here: stopping inside a tab would also hide the other tabs."""
-    st.header('Build the data model')
-    st.caption('Revenue usually lives in one big table of transactions (the FACT table) while names '
-               'such as store type, category and product live in small LOOKUP tables. '
-               'Joining them lets you slice revenue by those names.')
+fact = ds.fact
+sig = f"{len(fact)}-{fact['Revenue'].sum():.2f}-{fact['Year'].min()}-{fact['Year'].max()}"  # resets filter widgets when data changes
 
-    names = list(usable)
-    biggest = max(names, key=lambda n: len(usable[n].df))
-    fact_name = st.selectbox('1. Fact table (the one with one row per sale or transaction)', names,
-                             index=names.index(biggest), key='model_fact')
-    fact = usable[fact_name].df
-    st.caption(f'{len(fact):,} rows. Every join below must keep exactly this many rows.')
+# ------------------------------------------------------------------ sidebar: filters
+with st.sidebar:
+    st.divider()
+    st.header("Filters")
+    all_years = sorted(int(y) for y in fact["Year"].dropna().unique())
+    all_channels = sorted(fact["Channel"].unique())
+    all_cats = sorted(fact["Category"].unique())
+    all_stores = sorted(fact["Store"].unique())
+    sel_years = st.multiselect("Year", all_years, default=all_years, key=f"yr_{sig}")
+    sel_channels = st.multiselect("Sales channel", all_channels, default=all_channels, key=f"ch_{sig}")
+    sel_cats = st.multiselect("Product category", all_cats, default=all_cats, key=f"ca_{sig}")
+    sel_stores = st.multiselect("Store", all_stores, default=all_stores, key=f"st_{sig}")
+    st.caption("Charts, KPIs and the optional filtered assistant scope recalculate when filters change.")
 
-    # ---- joins
-    st.subheader('2. Lookup tables')
-    merged = fact.copy()
-    others = [n for n in names if n != fact_name]
-    suggestions = {}
-    for n in others:
-        try:
-            suggestions[n] = analytics.suggest_join_keys(fact, usable[n].df)
-        except Exception as exc:  # never let key detection take down the app
-            suggestions[n] = []
-            st.warning(f'Could not auto-detect keys for {n} ({type(exc).__name__}: {exc}). Choose them manually.')
-    others.sort(key=lambda n: 0 if suggestions[n] else 1)  # tables with an obvious key first
-    guess_value_col = analytics.suggest_revenue_column(fact)
-    join_reports = []
+filtered = A.filter_fact(fact, sel_years, sel_channels, sel_cats, sel_stores)
+filter_text = A.describe_filters(sel_years, sel_channels, sel_cats, sel_stores, fact)
+filters_active = not (
+    set(sel_years) == set(all_years) and set(sel_channels) == set(all_channels)
+    and set(sel_cats) == set(all_cats) and set(sel_stores) == set(all_stores)
+)
 
-    if not others:
-        st.info('Only one table was uploaded, so there is nothing to join. '
-                'Upload the lookup tables too if you want to slice by store, category, etc.')
-    for n in others:
-        best = suggestions[n][0] if suggestions[n] else None
-        title = f'{n}  (key found: {best["left"]} = {best["right"]})' if best else f'{n}  (no obvious key)'
-        with st.expander(title, expanded=bool(best)):
-            use = st.checkbox('Join this table to the model', value=bool(best), key=f'model_use_{fact_name}|{n}')
-            if not use:
-                continue
-            right_df = usable[n].df
-            left_opts, right_opts = list(merged.columns), list(right_df.columns)
-            c1, c2 = st.columns(2)
-            left_key = c1.selectbox('Key column in the model so far', left_opts,
-                                    index=left_opts.index(best['left']) if best and best['left'] in left_opts else 0,
-                                    key=f'model_lk_{fact_name}|{n}')
-            right_key = c2.selectbox(f'Key column in this table', right_opts,
-                                     index=right_opts.index(best['right']) if best else 0,
-                                     key=f'model_rk_{fact_name}|{n}')
-            try:
-                merged, rep = analytics.join_tables(merged, right_df, left_key, right_key,
-                                                    right_name=usable[n].name, value_col=guess_value_col)
-            except analytics.JoinError as exc:
-                st.error(f'Join refused: {exc}')
-                continue
-            join_reports.append(rep)
-            if rep['unmatched_rows']:
-                st.warning(f"{rep['unmatched_rows']:,} rows ({rep['unmatched_pct']}%) have no match in this table. "
-                           f"Example keys: {rep['unmatched_key_examples']}. "
-                           'Check for typos, extra spaces, or missing lookup rows.')
-            else:
-                st.success(f"All {rep['rows_after']:,} rows matched. Row count unchanged.")
-            st.caption('Columns added: ' + ', '.join(rep['added_columns']))
-            if rep['lookup_rows_never_used']:
-                st.caption(f"{rep['lookup_rows_never_used']} row(s) of this table are never used by the fact table.")
-
-    # ---- revenue
-    st.subheader('3. Revenue')
-    mode = st.radio('How is revenue defined?',
-                    ['Use an existing column', 'Calculate quantity x price (x discount)'],
-                    horizontal=True, key='model_rev_mode')
-    numeric_cols = analytics.find_numeric_columns(merged)
-    if not numeric_cols:
-        st.error('No numeric columns were found, so revenue cannot be defined.')
-        return None
-
-    if mode == 'Use an existing column':
-        default = guess_value_col if guess_value_col in numeric_cols else numeric_cols[0]
-        measure = st.selectbox('Revenue column', numeric_cols, index=numeric_cols.index(default),
-                               key='model_rev_col')
-        coerced = pd.to_numeric(merged[measure], errors='coerce')
-        lost = int(coerced.isna().sum() - merged[measure].isna().sum())
-        if lost:
-            st.warning(f'{lost:,} value(s) in {measure} are not numbers and will be ignored.')
-        merged[measure] = coerced
-        definition = f'Revenue = sum of column {measure}'
-    else:
-        q, p, d = st.columns(3)
-        qty = q.selectbox('Quantity column', numeric_cols, key='model_qty')
-        price = p.selectbox('Unit price column', numeric_cols, index=min(1, len(numeric_cols) - 1), key='model_price')
-        disc = d.selectbox('Discount column (fraction, optional)', ['None'] + numeric_cols, key='model_disc')
-        measure = 'Revenue (calculated)' if 'Revenue' in merged.columns else 'Revenue'
-        try:
-            merged, rev_rep = analytics.add_revenue(merged, qty, price, None if disc == 'None' else disc, name=measure)
-        except ValueError as exc:
-            st.error(str(exc))
-            return None
-        definition = f"Revenue = {rev_rep['definition']}"
-        if rev_rep['rows_without_revenue']:
-            st.warning(f"{rev_rep['rows_without_revenue']:,} rows lack a quantity or price, so they have no revenue.")
-
-    # ---- date
-    st.subheader('4. Date')
-    date_options = ['None'] + analytics.find_date_columns(merged)
-    date_choice = st.selectbox('Date column (only columns that really contain dates are listed)',
-                               date_options, index=1 if len(date_options) > 1 else 0, key='model_date')
-    date_col, year_col, month_col = None, None, None
-    if date_choice != 'None':
-        merged, drep = analytics.add_date_parts(merged, date_choice)
-        date_col, year_col, month_col = date_choice, drep['year_col'], drep['month_col']
-        st.caption(f"Dates run from {drep['first']} to {drep['last']}.")
-        if drep['unparseable']:
-            st.warning(f"{drep['unparseable']:,} value(s) are not valid dates and are left out of time charts.")
-
-    # ---- summary and checks
-    st.subheader('Model summary')
-    total = analytics.get_total(merged, measure)
-    m1, m2, m3 = st.columns(3)
-    m1.metric('Rows', f'{len(merged):,}')
-    m2.metric('Columns', merged.shape[1])
-    m3.metric(f'Total {measure}', money(total.value))
-    st.markdown(f'**Definition:** {definition}')
-
-    problems = False
-    if len(merged) != len(fact):
-        st.error(f'Row count changed from {len(fact):,} to {len(merged):,}. Fix the joins before trusting any total.')
-        problems = True
-    if measure in fact.columns:
-        fact_total = float(pd.to_numeric(fact[measure], errors='coerce').sum())
-        if abs(fact_total - total.value) > 1e-6:
-            st.error(f'Total changed after joining: {money(fact_total)} before, {money(total.value)} after.')
-            problems = True
-        else:
-            st.success(f'Check passed: the total ({money(total.value)}) equals the fact table total before any join.')
-    if any(r['unmatched_rows'] for r in join_reports):
-        st.warning('Some rows did not match a lookup table. Their category/store fields will be blank in the dashboard.')
-    with st.expander('Preview of the model table'):
-        st.dataframe(merged.head(100))
-
-    return {'df': merged, 'measure': measure, 'date_col': date_col, 'year_col': year_col,
-            'month_col': month_col, 'definition': definition, 'ok': not problems}
+tab_dash, tab_profile, tab_validate, tab_assistant, tab_about = st.tabs(
+    ["Dashboard", "Data profile & model", "Validation", "Assistant", "About"]
+)
 
 
-# ---------------------------------------------------------------- 4. dashboard tab
-def render_dashboard(model: dict):
-    """Revenue dashboard. Uses `return` (not st.stop) so other tabs still render."""
-    data, measure, date_col = model['df'], model['measure'], model['date_col']
-    st.header('Revenue dashboard')
-    st.caption(f"{model['definition']}. Filters are in the sidebar.")
-    if not model['ok']:
-        st.warning('The model has unresolved problems (see the Model tab). Totals here may be wrong.')
-
-    # ---------- filters (options come from the FULL data so they never shift under you)
-    skip = {measure, date_col, model['year_col'], model['month_col']}
-    cat_cols = analytics.find_category_columns(data, exclude=skip)
-    selections = {}
-    with st.sidebar:
-        st.divider()
-        st.header('Dashboard filters')
-        if date_col:
-            years = analytics.filter_options(data[model['year_col']])
-            chosen = st.multiselect('Year (from the date column)', years, default=years, key='f_year')
-            selections[model['year_col']] = chosen
-            months = analytics.filter_options(data[model['month_col']])
-            chosen = st.multiselect('Month (from the date column)', months, default=months, key='f_month',
-                                    format_func=lambda m: calendar.month_abbr[m] if isinstance(m, int) else m)
-            selections[model['month_col']] = chosen
-        # pre-select up to three filter-friendly columns: few distinct values, and not a
-        # year/month field (the date filters above already cover those)
-        friendly = [c for c in cat_cols if not re.search(r'(?i)year|month', c)]
-        few = sorted(friendly, key=lambda c: data[c].nunique(dropna=True))[:3]
-        dims = st.multiselect('Filter by', cat_cols, default=few, key='f_dims',
-                              help='Add or remove filter fields.')
-        for col in dims:
-            options = analytics.filter_options(data[col])
-            selections[col] = st.multiselect(col, options, default=options, key=f'f_{col}')
-
-    filtered = analytics.filter_frame(data, selections)
-    st.caption(f'{len(filtered):,} of {len(data):,} rows match the filters.')
+# ------------------------------------------------------------------ Dashboard
+def render_dashboard():
+    st.subheader("Revenue dashboard")
+    st.caption(f"**Data:** {ds.source_label}  |  **Filters:** {filter_text}  |  **Period shown:** {A.period_label(filtered)}")
     if filtered.empty:
-        st.warning('No records match the selected filters. Widen the filters in the sidebar.')
+        st.warning("No records match the selected filters. Widen the filters in the sidebar.")
         return
+    f = filtered
+    total = A.total_revenue(f)
+    by_ch = A.revenue_by(f, "Channel")
+    n_months = f.dropna(subset=["Year", "Month"])[["Year", "Month"]].drop_duplicates().shape[0]
 
-    # ---------- KPIs
-    total = analytics.get_total(filtered, measure)
-    monthly = analytics.monthly_revenue(filtered, date_col, measure) if date_col else None
-    group_options = cat_cols
-    # default breakdown: a column with no missing values and a readable number of groups
-    complete = [c for c in group_options if not data[c].isna().any() and 3 <= data[c].nunique() <= 12
-                and not re.search(r'(?i)year|month', c)]
-    default_group = complete[0] if complete else (group_options[0] if group_options else None)
-    group_col = (st.selectbox('Break down revenue by', group_options, key='dash_group',
-                              index=group_options.index(default_group)) if group_options else None)
-    share = analytics.revenue_share(filtered, measure, group_col) if group_col else None
+    cols = st.columns(2 + min(len(by_ch), 3) + 1)
+    cols[0].metric("Total revenue", money(total), help="Sum of Revenue for the filtered rows.")
+    for i, row in enumerate(by_ch.head(3).itertuples(index=False), start=1):
+        cols[i].metric(f"{row.Channel} revenue", money(row.Revenue), f"{row._2:.1f}% of total", delta_color="off")
+    cols[-2].metric("Average per month", money(total / n_months) if n_months else "n/a", help="Total revenue / months with data.")
+    cols[-1].metric("Sales rows", f"{len(f):,}")
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric(f'Total {measure}', money(total.value))
-    k2.metric('Records', f'{len(filtered):,}')
-    if monthly and monthly.value:
-        k3.metric('Average per month', money(sum(monthly.value.values()) / len(monthly.value)))
-    else:
-        k3.metric('Average per month', 'n/a')
-    if share and share.value:
-        top_name, top_vals = next(iter(share.value.items()))
-        k4.metric(f'Top {group_col}', top_name, f"{top_vals['share_pct']}% of revenue", delta_color='off')
-    else:
-        k4.metric('Top group', 'n/a')
-
-    # ---------- charts
+    period = A.period_label(f)
     left, right = st.columns(2)
     with left:
-        st.subheader('Monthly revenue')
-        if monthly and monthly.value:
-            st.line_chart(pd.Series(monthly.value, name=measure))
-            st.caption(' '.join(monthly.caveats))
-        else:
-            st.info('Choose a date column in the Model tab to see a monthly trend.')
+        by_year = A.revenue_by_year(f, by="Channel")
+        fig = px.bar(by_year, x="Year", y="Revenue", color="Channel", barmode="stack",
+                     title=f"Revenue by year and channel ({period})", labels={"Revenue": "Revenue ($)"})
+        fig.update_xaxes(type="category")
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", legend_title_text="")
+        st.plotly_chart(fig, width="stretch")
+        yt = A.revenue_by_year(f)
+        yt["Change vs prior year"] = yt["Revenue"].pct_change() * 100
+        yt["Months of data"] = yt["Year"].map(lambda y: A.months_present(f, y))
+        st.dataframe(
+            yt.assign(Revenue=yt["Revenue"].map(lambda v: money(v)), **{"Change vs prior year": yt["Change vs prior year"].map(lambda v: "" if pd.isna(v) else f"{v:+.1f}%")}),
+            hide_index=True, width="stretch",
+        )
     with right:
-        st.subheader('Revenue by year')
-        yoy = analytics.yoy_growth(filtered, date_col, measure) if date_col else None
-        if yoy and yoy.value:
-            table = pd.DataFrame(yoy.value).T
-            st.bar_chart(table['total'].rename(measure))
-            show = table.rename(columns={'total': measure, 'yoy_pct': 'Change vs prior year (%)',
-                                         'months_with_data': 'Months of data'})
-            st.dataframe(show)
-            st.caption(' '.join(yoy.caveats))
+        m = A.revenue_by_month(f)
+        m["Year"] = m["Year"].astype(str)
+        fig = px.line(m, x="Month name", y="Revenue", color="Year", markers=True,
+                      category_orders={"Month name": A.MONTH_NAMES}, title=f"Monthly revenue pattern ({period})",
+                      labels={"Revenue": "Revenue ($)", "Month name": "Month"})
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
+        st.plotly_chart(fig, width="stretch")
+        ms = A.monthly_share(f)
+        if not ms.empty:
+            piv = ms.pivot(index="Year", columns="Month", values="Share of year %").reindex(columns=range(1, 13))
+            piv.columns = A.MONTH_NAMES
+            fig = px.imshow(piv, text_auto=".1f", aspect="auto", color_continuous_scale="Blues",
+                            title="Each month as % of its own year's revenue (same filters)",
+                            labels={"color": "% of year", "x": "Month", "y": "Year"})
+            fig.update_yaxes(type="category")
+            st.plotly_chart(fig, width="stretch")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        n_show = st.slider("Stores to show", 3, max(3, f["Store"].nunique()), min(10, max(3, f["Store"].nunique())), key=f"nshow_{sig}") if f["Store"].nunique() > 3 else f["Store"].nunique()
+        by_store = A.revenue_by(f, "Store").head(n_show).iloc[::-1]
+        fig = px.bar(by_store, x="Revenue", y="Store", orientation="h", title=f"Revenue by store, top {n_show} ({period})",
+                     labels={"Revenue": "Revenue ($)"})
+        fig.update_layout(xaxis_tickprefix="$", xaxis_tickformat=",.0f")
+        st.plotly_chart(fig, width="stretch")
+    with c2:
+        by_cat = A.revenue_by(f, "Category")
+        fig = px.bar(by_cat, x="Category", y="Revenue", title=f"Revenue by product category ({period})",
+                     labels={"Revenue": "Revenue ($)"}, text=by_cat["Share %"].map(lambda v: f"{v:.1f}%"))
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
+        st.plotly_chart(fig, width="stretch")
+
+    with st.expander("Filtered records"):
+        st.dataframe(f.head(500), hide_index=True, width="stretch")
+        st.download_button("Download filtered records (CSV)", f.to_csv(index=False).encode(), "epresso_filtered.csv", "text/csv")
+
+
+# ------------------------------------------------------------------ Profile & model
+def render_profile():
+    st.subheader("Data profile and model")
+    p = A.profile_dataset(ds)
+    for msg in load_messages:
+        st.caption("• " + msg)
+    st.markdown("#### Tables loaded")
+    st.dataframe(p["summary"], hide_index=True, width="stretch")
+    st.markdown("#### Grain statements (what one row means)")
+    st.dataframe(p["grain"], hide_index=True, width="stretch")
+    st.markdown("#### Table relationships (all many-to-one)")
+    st.dataframe(p["relationships"], hide_index=True, width="stretch")
+    st.caption(
+        "The model joins Sales -> Stores (Store ID), Products (Product ID) and Categories (Category ID). "
+        "Survey is store-by-year, so it is **never joined row-by-row to Sales** (that would repeat each survey row for "
+        "every sale); it is only matched on Store ID + Year after revenue is totalled."
+    )
+    st.markdown("#### Join reconciliation (row count and revenue must not change)")
+    rec = p["reconciliation"].copy()
+    rec["Total revenue"] = rec["Total revenue"].map(lambda v: money(v, cents=True))
+    st.dataframe(rec, hide_index=True, width="stretch")
+    if p["reconciliation"]["OK"].all():
+        st.success("Every join preserved the row count and the revenue total.")
+    st.markdown("#### Missing values")
+    if p["missing"].empty:
+        st.success("No missing values in any table.")
+    else:
+        st.dataframe(p["missing"], hide_index=True, width="stretch")
+    st.markdown("#### Other data-quality checks")
+    st.dataframe(pd.DataFrame({"Check": list(p["checks"]), "Count": list(p["checks"].values())}), hide_index=True, width="stretch")
+    if p["notes"]:
+        st.markdown("#### Warnings")
+        for n in p["notes"]:
+            st.warning(n)
+    st.markdown("#### Preview a table")
+    name = st.selectbox("Table", list(ds.tables), key=f"prev_{sig}")
+    st.dataframe(ds.tables[name].head(100), hide_index=True, width="stretch")
+    st.markdown("**Revenue definition:** Revenue is a stored dollar amount per store x product x month in the Sales table "
+                "(it is not calculated from quantity x price). Total revenue = sum of that column.")
+
+
+# ------------------------------------------------------------------ Validation
+def validation_rows() -> pd.DataFrame:
+    full = ds.fact
+    rows = [("Total revenue", A.total_revenue(full))]
+    for r in A.revenue_by(full, "Channel").sort_values("Channel").itertuples(index=False):
+        rows.append((f"{r.Channel} revenue", r.Revenue))
+    for r in A.revenue_by_year(full).itertuples(index=False):
+        rows.append((f"Annual revenue {r.Year}", r.Revenue))
+    mm = full.dropna(subset=["Month"]).groupby("Month")["Revenue"].sum()
+    for mth, v in mm.items():
+        rows.append((f"Monthly revenue - {A.MONTH_NAMES[int(mth) - 1]} (all years)", v))
+    for r in A.revenue_by(full, "Category").sort_values("Category").itertuples(index=False):
+        rows.append((f"Additional: {r.Category} revenue", r.Revenue))
+    return pd.DataFrame(rows, columns=["Metric", "Streamlit result"])
+
+
+def snapshot() -> dict:
+    full = ds.fact
+    return {
+        "label": ds.source_label, "fingerprint": data_fingerprint(full), "total": A.total_revenue(full),
+        "by_year": A.revenue_by_year(full).set_index("Year")["Revenue"],
+        "by_channel": full.groupby("Channel")["Revenue"].sum(),
+        "by_month": full.dropna(subset=["Year", "Month"]).groupby(["Year", "Month"])["Revenue"].sum(),
+    }
+
+
+def render_validation():
+    st.subheader("Validation against Power BI")
+    st.info("Validation always uses the **full, unfiltered** data, so it is comparable to the Power BI report totals.")
+    base = validation_rows()
+    base["Power BI result"] = ""
+    st.markdown("**Step 1.** Type your Power BI value for each metric (numbers only; $ and commas are fine). "
+                "Streamlit results are calculated live from the loaded data.")
+    edited = st.data_editor(
+        base[["Metric", "Power BI result", "Streamlit result"]], hide_index=True, width="stretch",
+        disabled=["Metric", "Streamlit result"], key=f"val_{sig}",
+        column_config={"Streamlit result": st.column_config.NumberColumn(format="$%.2f")},
+    )
+    pb = pd.to_numeric(edited["Power BI result"].astype(str).str.replace(r"[$,\s]", "", regex=True), errors="coerce")
+    out = edited.copy()
+    out["Power BI result"] = pb
+    out["Difference"] = out["Streamlit result"] - pb
+    out["Match?"] = ["" if pd.isna(d) else ("Yes" if abs(d) < 0.5 else "NO - investigate") for d in out["Difference"]]
+    st.markdown("**Step 2.** Results table (copy into your report; investigate every 'NO').")
+    st.dataframe(out, hide_index=True, width="stretch",
+                 column_config={c: st.column_config.NumberColumn(format="$%.2f") for c in ["Power BI result", "Streamlit result", "Difference"]})
+    st.download_button("Download validation table (CSV)", out.to_csv(index=False).encode(), "validation_table.csv", "text/csv")
+    st.caption("If a value differs: check Power BI filters/relationships (e.g. a Sales -> Survey relationship used for filtering), "
+               "blank-key rows, and rounding. Power BI is not automatically correct.")
+
+    st.divider()
+    st.subheader("Modified-data ($1,000) test helper")
+    st.markdown(
+        "1. With the **original** data loaded, click *Save baseline*.\n"
+        "2. Create the modified copy (`python scripts/make_modified_data.py`) and upload its files in the sidebar.\n"
+        "3. Come back here: the total should be **exactly $1,000** higher, and exactly one year, one month and one channel should change.\n"
+        "4. Remove the uploaded files to restore the original data."
+    )
+    if st.button("Save baseline from the currently loaded data", key="save_base"):
+        st.session_state["baseline"] = snapshot()
+    b = st.session_state.get("baseline")
+    if b:
+        cur = snapshot()
+        st.markdown(f"**Baseline:** {b['label']} - {b['fingerprint']}")
+        st.markdown(f"**Current:** {cur['label']} - {cur['fingerprint']}")
+        diff = cur["total"] - b["total"]
+        if abs(diff) < 0.005:
+            st.info("Current total equals the baseline (no change loaded yet).")
+        elif abs(diff - 1000) < 0.005:
+            st.success(f"PASS: total revenue increased by exactly {money(diff, cents=True)}.")
         else:
-            st.info('Choose a date column in the Model tab to see yearly revenue.')
+            st.error(f"Total changed by {money(diff, cents=True)}, which is not exactly $1,000.00.")
+        d_year = (cur["by_year"] - b["by_year"].reindex(cur["by_year"].index, fill_value=0)).rename("Change")
+        d_ch = (cur["by_channel"] - b["by_channel"].reindex(cur["by_channel"].index, fill_value=0)).rename("Change")
+        d_mo = (cur["by_month"] - b["by_month"].reindex(cur["by_month"].index, fill_value=0)).rename("Change")
+        c1, c2, c3 = st.columns(3)
+        c1.markdown("**Years that changed**")
+        c1.dataframe(d_year[d_year.abs() > 0.005], width="stretch")
+        c2.markdown("**Channels that changed**")
+        c2.dataframe(d_ch[d_ch.abs() > 0.005], width="stretch")
+        c3.markdown("**Year-months that changed**")
+        c3.dataframe(d_mo[d_mo.abs() > 0.005], width="stretch")
 
-    st.subheader(f'Revenue by {group_col}' if group_col else 'Revenue breakdown')
-    if share and share.value:
-        n_show = st.slider('Show top N groups', 3, 20, 10, key='dash_topn') if len(share.value) > 3 else len(share.value)
-        top = analytics.top_n(filtered, measure, group_col, n=n_show)
-        b1, b2 = st.columns(2)
-        b1.bar_chart(pd.Series(top.value, name=measure))
-        table = pd.DataFrame(share.value).T.head(n_show)
-        b2.dataframe(table.rename(columns={'total': measure, 'share_pct': 'Share (%)'}))
-        st.caption(' '.join(share.caveats))
-    else:
-        st.info('No category columns are available for a breakdown.')
-
-    # ---------- validation helper
-    with st.expander('Validation helper: numbers to compare with Power BI or Excel'):
-        active = {k: v for k, v in selections.items() if len(v) < len(analytics.filter_options(data[k]))}
-        st.markdown(f'**Filters applied:** {active if active else "none"}')
-        st.markdown(f'**Rows:** {len(filtered):,}   **Total {measure}:** {total.value:,.2f}')
-        if date_col and yoy and yoy.value:
-            st.dataframe(pd.DataFrame(yoy.value).T[['total']].rename(columns={'total': measure}))
-    with st.expander('Data quality of the model table'):
-        profile = analytics.profile_table(data)
-        q1, q2, q3 = st.columns(3)
-        q1.metric('Rows', f"{profile['rows']:,}")
-        q2.metric('Columns', profile['columns'])
-        q3.metric('Duplicate rows', profile['duplicate_rows'])
-        st.dataframe(profile['missing'], hide_index=True)
-    with st.expander('Filtered records'):
-        st.dataframe(filtered, hide_index=True)
+    st.divider()
+    st.subheader("Independent verification")
+    st.markdown("Run `python scripts/independent_check.py` (reads the raw CSVs without using this app's code) and compare its "
+                "total, channel, annual and monthly figures with the table above. Save the output as evidence.")
 
 
-# ---------------------------------------------------------------- 5. tabs
-tab_data, tab_model, tab_dash, tab_assistant = st.tabs(['Data and profile', 'Model', 'Dashboard', 'Assistant'])
-
-with tab_data:
-    st.subheader('Files and tables found')
-    st.dataframe(loading.describe_tables(list(loaded.values())), hide_index=True)
-    names = list(usable)
-    chosen = st.selectbox('Table to profile', names,
-                          index=names.index(max(names, key=lambda n: len(usable[n].df))), key='profile_table')
-    df = usable[chosen].df
-    st.subheader(f'Profile: {chosen}')
-    profile = analytics.profile_table(df)
-    c1, c2, c3 = st.columns(3)
-    c1.metric('Rows', f"{profile['rows']:,}")
-    c2.metric('Columns', profile['columns'])
-    c3.metric('Duplicate rows', profile['duplicate_rows'])
-    st.subheader('Preview')
-    st.dataframe(df.head(50))
-    left, right = st.columns(2)
-    left.subheader('Missing values')
-    left.dataframe(profile['missing'])
-    right.subheader('Data types')
-    right.dataframe(profile['dtypes'])
-
-model = None
-with tab_model:
-    try:
-        model = render_model_tab(usable)
-    except Exception as exc:  # show the real error (Streamlit Cloud redacts it otherwise)
-        st.error(f'Model tab error: {type(exc).__name__}: {exc}')
-        st.code(traceback.format_exc())
-
-with tab_dash:
-    if model is None:
-        st.info('Finish the Model tab first.')
-    else:
+# ------------------------------------------------------------------ Assistant
+def render_assistant():
+    st.subheader("Analytical assistant")
+    api_key = get_secret("GEMINI_API_KEY")
+    model = get_secret("GEMINI_MODEL", "gemini-2.5-flash")
+    max_q = int(get_secret("MAX_QUESTIONS", DEFAULT_MAX_QUESTIONS))
+    force_rules = st.checkbox("Use the rules-based assistant only (no language model)", value=False, key="force_rules")
+    client = None
+    if api_key and not force_rules:
         try:
-            render_dashboard(model)
-        except Exception as exc:
-            st.error(f'Dashboard error: {type(exc).__name__}: {exc}')
-            st.code(traceback.format_exc())
-
-with tab_assistant:
-    st.caption('Mode: rules-based starter. Describe what you actually built here.')
-    if model is None:
-        st.info('Finish the Model tab first. The assistant answers from the model table.')
+            client = get_client(str(api_key))
+        except agent.LLMUnavailable as exc:
+            st.warning(f"Language model unavailable ({exc}); using the rules-based assistant.")
+    if client:
+        st.success(f"Mode: language-model agent ({model}, Google Gemini function calling) with automatic fallback to the rules-based assistant.")
     else:
-        st.session_state.setdefault('n_questions', 0)
-        st.session_state.setdefault('history', [])
-        for item in st.session_state['history']:
-            with st.chat_message('user'):
-                st.write(item['question'])
-            with st.chat_message('assistant'):
-                st.markdown(f"**Scope:** {item['answer']['scope']}")
-                st.markdown(f"**Findings:** {item['answer']['findings']}")
-                if item['answer']['interpretation']:
-                    st.markdown(f"**Interpretation:** {item['answer']['interpretation']}")
-                with st.expander('Tool-call log'):
-                    st.json(item['answer']['tool_log'])
-        question = st.chat_input('Ask a question about the loaded data')
-        if question:
-            if st.session_state['n_questions'] >= MAX_QUESTIONS:
-                st.warning('Question limit reached for this session. Reload the page to start over.')
-            else:
-                st.session_state['n_questions'] += 1
-                answer = agent.answer_question(question, model['df'], mode='rules',
-                                               value_col=model['measure'], date_col=model['date_col'])
-                st.session_state['history'].append({'question': question, 'answer': answer})
-                st.rerun()
+        st.info("Mode: **rules-based assistant** (keyword routing to real analytical functions; not a language model).")
+    st.caption("The assistant can only call approved functions: " + ", ".join(agent.TOOLS) +
+               ". It cannot run code or change data. Every answer shows a tool-call log.")
+
+    scope_choice = st.radio(
+        "Answer from", ["Full dataset (ignore dashboard filters)", "Dashboard-filtered subset"], horizontal=True, key="scope_choice"
+    )
+    if scope_choice.startswith("Full"):
+        scope, data_for_agent = f"FULL dataset (dashboard filters not applied) - {data_fingerprint(fact)}", fact
+    else:
+        scope = f"DASHBOARD-FILTERED subset ({filter_text}) - {data_fingerprint(filtered)}" if filters_active else \
+                f"Dashboard-filtered subset (no filters currently active, so same as full dataset) - {data_fingerprint(filtered)}"
+        data_for_agent = filtered
+    st.caption(f"Current scope: {scope}")
+
+    st.session_state.setdefault("n_questions", 0)
+    st.session_state.setdefault("history", [])
+    left = max_q - st.session_state["n_questions"]
+    st.caption(f"Questions left this session: **{max(left, 0)}** of {max_q}")
+
+    examples = [
+        "How much revenue did the website generate in 2028?",
+        "Which store experienced the greatest percentage revenue decline?",
+        "Which sales channel experienced the greatest revenue growth?",
+        "Which E-Presso store is the most profitable?",
+        "Does higher customer satisfaction cause higher revenue?",
+        "Should E-Presso close its Chicago store?",
+        "Which month is busiest?",
+    ]
+    with st.expander("Example questions (click to ask)"):
+        for i, q in enumerate(examples):
+            if st.button(q, key=f"ex_{i}"):
+                st.session_state["pending_q"] = q
+
+    for item in st.session_state["history"]:
+        with st.chat_message("user"):
+            st.write(item["question"])
+        with st.chat_message("assistant"):
+            ans = item["answer"]
+            st.caption(f"Mode: {ans['mode']}  |  Scope: {ans['scope']}")
+            for note in ans.get("notes", []):
+                st.warning(note)
+            st.markdown(ans["answer"])
+            with st.expander(f"Tool-call log ({len(ans['tool_log'])} call(s))"):
+                if not ans["tool_log"]:
+                    st.write("No function was called for this question.")
+                for call in ans["tool_log"]:
+                    st.markdown(f"**Function:** `{call['function']}`  \n**Arguments:** `{call['arguments']}`  \n**Scope:** {call['scope']}")
+                    st.json(call["result"], expanded=False)
+
+    question = st.chat_input("Ask a business question about the loaded data", max_chars=MAX_QUESTION_CHARS)
+    question = question or st.session_state.pop("pending_q", None)
+    if question:
+        if st.session_state["n_questions"] >= max_q:
+            st.warning("Question limit reached for this session. Reload the page to start a new session.")
+        elif data_for_agent.empty:
+            st.warning("The current scope has no rows. Widen the dashboard filters or choose the full dataset.")
+        else:
+            st.session_state["n_questions"] += 1
+            with st.spinner("Calculating..."):
+                ans = agent.answer_question(question, ds, data_for_agent, scope, client=client, model=model)
+            st.session_state["history"].append({"question": question, "answer": ans})
+            st.rerun()
+    if st.session_state["history"] and st.button("Clear conversation (does not reset the question limit)"):
+        st.session_state["history"] = []
+        st.rerun()
+
+
+# ------------------------------------------------------------------ About
+def render_about():
+    st.subheader("About this application")
+    st.markdown(
+        """
+**Purpose.** Explore E-Presso revenue by year, month, channel, store and category, check the data, and ask an analytical assistant.
+
+**Definitions**
+- *Revenue* = the stored dollar amount per store x product x month in the Sales table. It is **not profit**; no cost data exists.
+- *Channel* = the store type: `Website` or `Brick & Mortar`.
+- *Monthly share* = a month's revenue / that calendar year's revenue (same filters).
+- *Percent change* = (end - start) / start; undefined when the start value is zero.
+
+**Data model.** Sales (one row per store x product x month) joins many-to-one to Stores, Products and Categories. Survey (one row per store x year)
+is kept separate. Every join is checked to keep the row count and revenue total unchanged. Products are joined by ID because product names repeat across categories.
+
+**The assistant.** Questions are routed to approved functions in `analytics.py` through a whitelisted dispatcher. With a Gemini API key configured it is a
+language-model agent (function calling); without one (or if the API fails or the quota runs out) it is a rules-based assistant. It never executes generated code,
+never edits data, and every answer lists the function, arguments and raw result.
+
+**Known limitations**
+- Revenue only: no costs, units, prices, or customer-level data. Satisfaction survey has no response counts or scale definition and the website has no survey scores.
+- Comparisons that involve a year with fewer than 12 months are flagged as not like-for-like.
+- Correlation shown by the assistant is not causation.
+        """
+    )
+
+
+# ------------------------------------------------------------------ render (errors in one tab never hide the others)
+for tab, fn in [(tab_dash, render_dashboard), (tab_profile, render_profile), (tab_validate, render_validation),
+                (tab_assistant, render_assistant), (tab_about, render_about)]:
+    with tab:
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - show the real error (Streamlit Cloud redacts it otherwise)
+            st.error(f"{fn.__name__} failed: {type(exc).__name__}: {exc}")
+            st.code(traceback.format_exc())

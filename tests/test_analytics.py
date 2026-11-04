@@ -1,151 +1,206 @@
-"""Run with:  pytest -q
-Tiny tables whose answers you can check in your head. If one of these fails, fix the function
-BEFORE connecting it to the assistant."""
+"""Run with:  python -m pytest -q   (from the repository root)"""
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
 import pandas as pd
 import pytest
 
-import agent
-import analytics as a
-
-sales = pd.DataFrame({
-    'Sales ID': ['a', 'b', 'c', 'd'],
-    'Date': ['2025-01-31', '2025-02-28', '2025-02-28', '2026-01-31'],
-    'Store ID': ['S1', 'S1', 'S2', 'S2'],
-    'Product ID': ['P1', 'P2', 'P1', 'P2'],
-    'Revenue': [10.0, 20.0, 5.0, 40.0],
-})
-stores = pd.DataFrame({'ID': ['S1', 'S2'], 'Channel': ['Web', 'Store']})
-products = pd.DataFrame({'Product ID': ['P1', 'P2'], 'Product': ['Latte', 'Mocha']})
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+import agent  # noqa: E402
+import analytics as A  # noqa: E402
 
 
-# ------------------------------------------------------------------ joins
-def test_join_keeps_row_count_and_total():
-    merged, rep = a.join_tables(sales, stores, 'Store ID', 'ID', 'Stores', value_col='Revenue')
-    assert len(merged) == len(sales) and not rep['row_count_changed']
-    assert rep['unmatched_rows'] == 0 and not rep['sum_changed']
-    assert list(merged['Channel']) == ['Web', 'Web', 'Store', 'Store']
+def _load(folder=ROOT / "data", overrides=None):
+    files = [(p.name, p.read_bytes()) for p in sorted(Path(folder).glob("*.csv"))]
+    tables, _, _ = A.load_tables(files)
+    if overrides:
+        tables.update(overrides)
+    return A.build_dataset(tables)
 
 
-def test_join_refuses_duplicate_lookup_keys():
-    bad = pd.DataFrame({'ID': ['S1', 'S1', 'S2'], 'Channel': ['Web', 'Web2', 'Store']})
-    with pytest.raises(a.JoinError):
-        a.join_tables(sales, bad, 'Store ID', 'ID', 'Stores')
+@pytest.fixture(scope="module")
+def ds():
+    return _load()
 
 
-def test_join_reports_unmatched_and_tolerates_spaces_and_number_types():
-    s = sales.assign(**{'Store ID': ['S1 ', 'S1', 'S2', 'S9']})  # trailing space, unknown store
-    merged, rep = a.join_tables(s, stores, 'Store ID', 'ID', 'Stores')
-    assert rep['unmatched_rows'] == 1 and rep['unmatched_key_examples'] == ['S9']
-    assert len(merged) == len(s)
-    nums = a.join_tables(pd.DataFrame({'k': [1, 2]}), pd.DataFrame({'k2': [1.0, 2.0], 'v': ['x', 'y']}), 'k', 'k2')[0]
-    assert list(nums['v']) == ['x', 'y']
+def raw_sales():
+    return pd.read_csv(ROOT / "data" / "sales.csv")
 
 
-def test_join_renames_colliding_columns():
-    merged, _ = a.join_tables(sales, products.assign(Revenue=0), 'Product ID', 'Product ID', 'Products')
-    assert 'Revenue (Products)' in merged.columns and merged['Revenue'].sum() == 75.0
+# ---- data handling ----
+def test_total_matches_raw_sum_and_joins_do_not_duplicate(ds):
+    assert A.total_revenue(ds.fact) == pytest.approx(raw_sales()["Revenue"].sum())
+    assert len(ds.fact) == len(raw_sales())
+    assert all(r["OK"] for r in ds.reconciliation)
 
 
-def test_suggest_join_keys_finds_obvious_keys():
-    assert a.suggest_join_keys(sales, stores)[0] == {'left': 'Store ID', 'right': 'ID', 'overlap': 1.0}
-    assert a.suggest_join_keys(sales, products)[0]['left'] == 'Product ID'
+def test_channel_year_month_partitions_sum_to_total(ds):
+    t = A.total_revenue(ds.fact)
+    assert A.revenue_by(ds.fact, "Channel")["Revenue"].sum() == pytest.approx(t)
+    assert A.revenue_by_year(ds.fact)["Revenue"].sum() == pytest.approx(t)
+    assert A.revenue_by_month(ds.fact)["Revenue"].sum() == pytest.approx(t)
+    assert A.revenue_by(ds.fact, "Category")["Revenue"].sum() == pytest.approx(t)
 
 
-# ------------------------------------------------------------------ revenue / dates
-def test_add_revenue_with_discount():
-    df = pd.DataFrame({'Qty': [2, 3], 'Price': [10.0, 5.0], 'Disc': [0.1, None]})
-    out, rep = a.add_revenue(df, 'Qty', 'Price', 'Disc')
-    assert list(out['Revenue']) == [18.0, 15.0] and rep['total'] == 33.0
+def test_monthly_shares_sum_to_100_per_year(ds):
+    ms = A.monthly_share(ds.fact)
+    assert ms.groupby("Year")["Share of year %"].sum().round(6).eq(100).all()
 
 
-def test_add_revenue_rejects_percent_discounts():
-    df = pd.DataFrame({'Qty': [1], 'Price': [10.0], 'Disc': [10]})
-    with pytest.raises(ValueError):
-        a.add_revenue(df, 'Qty', 'Price', 'Disc')
+def test_product_names_are_not_used_as_join_key(ds):
+    assert ds.tables["products"]["Product"].duplicated().any()  # 'Base Model' repeats
+    assert ds.fact["Product label"].nunique() == ds.fact["Product ID"].nunique()
 
 
-def test_date_parts_and_detectors():
-    out, rep = a.add_date_parts(sales, 'Date')
-    assert list(out['Date Year']) == [2025, 2025, 2025, 2026] and rep['unparseable'] == 0
-    assert a.find_date_columns(sales) == ['Date']          # IDs and names are not dates
-    assert a.suggest_revenue_column(sales) == 'Revenue'
-    assert 'Sales ID' not in a.find_category_columns(sales.assign(x=1))
+def test_filters_recalculate(ds):
+    f = A.filter_fact(ds.fact, years=[2028], channels=["Website"])
+    assert A.total_revenue(f) == pytest.approx(A.get_total_revenue(ds.fact, year=2028, channel="website")["total_revenue"])
+    assert A.total_revenue(A.filter_fact(ds.fact, years=[])) == 0
 
 
-def test_filter_frame_keeps_blank_rows():
-    df = pd.DataFrame({'City': ['A', None, 'B'], 'Revenue': [1, 2, 3]})
-    assert len(a.filter_frame(df, {'City': a.filter_options(df['City'])})) == 3  # nothing lost
-    assert len(a.filter_frame(df, {'City': ['A']})) == 1
-    assert len(a.filter_frame(df, {'City': ['A', a.BLANK]})) == 2
+# ---- $1,000 test ----
+def test_adding_1000_changes_total_by_exactly_1000_and_one_bucket():
+    base = _load()
+    s = base.tables["sales"].copy()
+    s.loc[0, "Revenue"] = str(float(s.loc[0, "Revenue"]) + 1000)
+    mod = _load(overrides={"sales": s})
+    assert A.total_revenue(mod.fact) - A.total_revenue(base.fact) == pytest.approx(1000)
+    for fn in (lambda d: A.revenue_by_year(d.fact), lambda d: A.revenue_by_month(d.fact)):
+        diff = (fn(mod)["Revenue"] - fn(base)["Revenue"]).round(6)
+        assert (diff != 0).sum() == 1 and diff.sum() == pytest.approx(1000)
+    # the assistant's tools read the new data too
+    a = agent.run_rules("What is the total revenue?", base, base.fact, "full")["tool_log"][0]["result"]["total_revenue"]
+    b = agent.run_rules("What is the total revenue?", mod, mod.fact, "full")["tool_log"][0]["result"]["total_revenue"]
+    assert b - a == pytest.approx(1000)
 
 
-# ------------------------------------------------------------------ analytical tools
-@pytest.fixture
-def model():
-    m, _ = a.join_tables(sales, stores, 'Store ID', 'ID', 'Stores')
-    m, _ = a.join_tables(m, products, 'Product ID', 'Product ID', 'Products')
-    return a.add_date_parts(m, 'Date')[0]
+def test_works_with_different_years_and_new_store():
+    base = _load()
+    s = base.tables["sales"].copy()
+    extra = s.head(12).copy()
+    extra["Sales ID"] = ["NEW" + str(i) for i in range(12)]
+    extra["Date"] = pd.to_datetime(extra["Date"]) + pd.DateOffset(years=5)  # 2030
+    stores = pd.concat([base.tables["stores"], pd.DataFrame([{"ID": "SH99", "City": "Austin", "State": "TX", "StoreType": "Brick & Mortar"}])])
+    extra["Store ID"] = "SH99"
+    mod = _load(overrides={"sales": pd.concat([s, extra]), "stores": stores})
+    assert 2030 in set(mod.fact["Year"].dropna())
+    assert A.get_total_revenue(mod.fact, store="Austin")["total_revenue"] == pytest.approx(extra["Revenue"].astype(float).sum())
 
 
-def test_get_total(model):
-    assert a.get_total(model, 'Revenue').value == 75.0
-    assert a.get_total(model, 'Revenue', {'Channel': 'Web'}).value == 30.0
+# ---- tools ----
+def test_store_trend_no_decline_case(ds):
+    only_web = A.get_store_trend(ds.fact, channel="Website")
+    assert only_web["stores_compared"] == 1
+    grown = ds.fact.copy()
+    grown["Revenue"] = grown["Revenue"] * (1 + (grown["Year"] - grown["Year"].min()).astype(float))  # everything grows
+    res = A.get_store_trend(grown)
+    assert res["stores_that_declined"] == 0 and res["largest_pct_decline"] is None
+    assert any("No location declined" in n for n in res["notes"])
 
 
-def test_group_total(model):
-    r = a.group_total(model, 'Revenue', 'Channel')
-    assert r.value == {'Store': 45.0, 'Web': 30.0} and r.rows_used == 4
+def test_unknown_and_ambiguous_inputs_return_errors_not_guesses(ds):
+    assert "error" in A.get_total_revenue(ds.fact, year=2035)
+    assert "error" in A.get_total_revenue(ds.fact, store="Atlantis")
+    amb = A.get_total_revenue(ds.fact, store="Orlando")
+    assert "error" in amb and "more than one" in amb["error"]
+    assert "error" in A.get_total_revenue(ds.fact, channel="carrier pigeon")
 
 
-def test_top_n(model):
-    assert list(a.top_n(model, 'Revenue', 'Product', n=1).value) == ['Mocha']  # 60 vs 15
-    assert a.top_n(model, 'Revenue', 'Product', n=0).error
+def test_satisfaction_result_reports_missing_and_caveats(ds):
+    r = A.get_satisfaction_vs_revenue(ds.fact, ds.survey)
+    assert r["location_years_missing_satisfaction"] == 5 and "SH00" in r["locations_missing_all_satisfaction"]
+    assert any("causation" in c.lower() for c in r["caveats"])
 
 
-def test_revenue_share(model):
-    r = a.revenue_share(model, 'Revenue', 'Channel')
-    assert r.value['Store'] == {'total': 45.0, 'share_pct': 60.0}
-    assert sum(v['share_pct'] for v in r.value.values()) == pytest.approx(100.0)
-
-
-def test_monthly_revenue(model):
-    assert a.monthly_revenue(model, 'Date').value == {'2025-01': 10.0, '2025-02': 25.0, '2026-01': 40.0}
-
-
-def test_yoy_growth(model):
-    r = a.yoy_growth(model, 'Date')
-    assert r.value['2025']['total'] == 35.0 and r.value['2025']['yoy_pct'] is None
-    assert r.value['2026']['yoy_pct'] == pytest.approx(14.29)       # (40-35)/35
-    assert any('fewer than 12 months' in c for c in r.caveats)
-
-
-def test_errors_are_returned_not_raised(model):
-    assert a.get_total(model, 'Nope').error
-    assert a.group_total(model, 'Revenue', 'Nope').error
-    assert a.get_total(model, 'Revenue', {'Channel': 'Moon'}).error   # value not in data
-    assert a.monthly_revenue(model, 'Nope').error
-
-
-def test_missing_and_bad_values_are_reported(model):
-    bad = model.copy()
-    bad.loc[0, 'Revenue'] = None
-    r = a.get_total(bad, 'Revenue')
-    assert r.value == 65.0 and r.rows_used == 3 and any('excluded' in c for c in r.caveats)
-
-
-# ------------------------------------------------------------------ assistant plumbing
-def test_dispatcher_rejects_unknown_tools_and_arguments(model):
+# ---- dispatcher / agent safety ----
+def test_dispatcher_rejects_unknown_tool_and_bad_args(ds):
     log = []
-    assert agent.run_tool('drop_table', {}, model, log).error
-    assert agent.run_tool('get_total', {'code': 'x'}, model, log).error
-    assert len(log) == 2
+    assert "error" in agent.run_tool("os.system", {"cmd": "ls"}, ds, ds.fact, "s", log)
+    assert "error" in agent.run_tool("get_total_revenue", {"evil": 1}, ds, ds.fact, "s", log)
+    assert "error" in agent.run_tool("get_total_revenue", {"year": "abc"}, ds, ds.fact, "s", log)
+    assert len(log) == 3 and all({"function", "arguments", "result"} <= set(c) for c in log)
 
 
-def test_rules_router_routes_to_tools(model):
-    ask = lambda q: agent.answer_question(q, model, value_col='Revenue', date_col='Date')
-    assert ask('revenue by channel')['tool_log'][0]['tool'] == 'group_total'
-    assert ask('top 1 product by revenue')['tool_log'][0]['result']['value'] == {'Mocha': 60.0}
-    assert ask('share of revenue by channel')['tool_log'][0]['tool'] == 'revenue_share'
-    assert ask('monthly trend')['tool_log'][0]['tool'] == 'monthly_revenue'
-    assert ask('year over year growth')['tool_log'][0]['tool'] == 'yoy_growth'
-    assert ask('what is the weather')['findings'] == agent.UNSUPPORTED
+def test_no_eval_or_exec_in_code():
+    for name in ("agent.py", "analytics.py", "streamlit_app.py"):
+        src = (ROOT / name).read_text()
+        assert "eval(" not in src.replace("evaluat", "") and "exec(" not in src
+
+
+@pytest.mark.parametrize("q,tool", [
+    ("How much revenue did the website generate in 2028?", "get_total_revenue"),
+    ("Which store experienced the greatest percentage revenue decline?", "get_store_trend"),
+    ("Which E-Presso store is the most profitable?", "get_data_limitations"),
+    ("Does higher customer satisfaction cause higher revenue?", "get_satisfaction_vs_revenue"),
+    ("Which sales channel experienced the greatest revenue growth?", "get_revenue_by_channel"),
+    ("Which month is busiest?", "get_monthly_revenue_share"),
+    ("any missing values or duplicates?", "get_data_quality_report"),
+])
+def test_rules_routing(ds, q, tool):
+    out = agent.run_rules(q, ds, ds.fact, "full")
+    assert tool in [c["function"] for c in out["tool_log"]]
+
+
+def test_rules_unsupported_and_profit_never_claims_profit(ds):
+    assert agent.run_rules("What is the weather in Denver?", ds, ds.fact, "full")["tool_log"] == []
+    ans = agent.run_rules("Which store is most profitable?", ds, ds.fact, "full")["answer"].lower()
+    assert "not profit" in ans or "cannot show profit" in ans
+
+
+def test_website_2028_matches_independent_calculation(ds):
+    s = raw_sales()
+    stores = pd.read_csv(ROOT / "data" / "stores.csv")
+    m = s.merge(stores[["ID", "StoreType"]], left_on="Store ID", right_on="ID")
+    expected = m[(m["StoreType"] == "Website") & (m["Date"].str[:4] == "2028")]["Revenue"].sum()
+    got = agent.run_rules("How much revenue did the website generate in 2028?", ds, ds.fact, "full")["tool_log"][0]["result"]["total_revenue"]
+    assert got == pytest.approx(expected)
+
+
+# ---- LLM loop with a fake Gemini client (no network) ----
+class _FakeResp:
+    def __init__(self, calls=None, text=None):
+        from google.genai import types
+        self.function_calls = calls or []
+        self.text = text
+        parts = [types.Part(function_call=types.FunctionCall(name=c.name, args=c.args)) for c in (calls or [])] or [types.Part(text=text or "")]
+        self.candidates = [SimpleNamespace(content=types.Content(role="model", parts=parts))]
+
+
+class _FakeClient:
+    def __init__(self, script):
+        self.script, self.seen = list(script), []
+        self.models = SimpleNamespace(generate_content=self._gen)
+
+    def _gen(self, model, contents, config):
+        self.seen.append(contents)
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_llm_loop_runs_our_function_and_logs_it(ds):
+    pytest.importorskip("google.genai")
+    call = SimpleNamespace(name="get_total_revenue", args={"year": 2028, "channel": "Website"})
+    client = _FakeClient([_FakeResp(calls=[call]), _FakeResp(text="**Findings** The website made $6,339,640 in 2028.")])
+    out = agent.answer_question("website 2028?", ds, ds.fact, "full", client=client)
+    assert out["mode"] == "llm" and out["tool_log"][0]["function"] == "get_total_revenue"
+    assert out["tool_log"][0]["result"]["total_revenue"] == 6339640.0
+    # the tool result was passed back to the model
+    assert "6339640" in str(client.seen[1][-1])
+
+
+def test_llm_failure_or_quota_falls_back_to_rules(ds):
+    pytest.importorskip("google.genai")
+    for err in (RuntimeError("429 RESOURCE_EXHAUSTED quota"), ConnectionError("boom")):
+        out = agent.answer_question("total revenue?", ds, ds.fact, "full", client=_FakeClient([err]))
+        assert out["mode"] == "rules (fallback)" and out["tool_log"] and "unavailable" in out["notes"][0]
+
+
+def test_llm_answer_without_tool_is_flagged(ds):
+    pytest.importorskip("google.genai")
+    client = _FakeClient([_FakeResp(text="Revenue was $1."), _FakeResp(text="Revenue was $1.")])
+    out = agent.answer_question("total revenue?", ds, ds.fact, "full", client=client)
+    assert any("NOT verified" in n for n in out["notes"])
