@@ -109,16 +109,41 @@ def _read_csv_bytes(data: bytes) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(text), sep=delim, header=None, dtype=str, keep_default_na=True)
 
 
+def _read_access(data: bytes) -> dict[str, pd.DataFrame]:
+    """Read every user table in an Access (.accdb/.mdb) file with the pure-Python access-parser package."""
+    import tempfile
+
+    from access_parser import AccessParser
+
+    with tempfile.NamedTemporaryFile(suffix=".accdb") as tmp:
+        tmp.write(data)
+        tmp.flush()
+        db = AccessParser(tmp.name)
+        out = {}
+        for name in db.catalog:
+            if name.startswith("MSys") or name.startswith("f_"):  # Access system / attachment tables
+                continue
+            parsed = db.parse_table(name)
+            if parsed:
+                out[name] = pd.DataFrame(parsed)
+    return out
+
+
 def _read_other(fname: str, data: bytes) -> dict[str, pd.DataFrame]:
     """
-    Access (.accdb/.mdb), SQLite and similar: delegate to the starter template's loading.py
-    (kept in the repo next to this file). Returns {table label: DataFrame with real headers}.
+    Access files are read natively. Other database formats (e.g. SQLite) are delegated to the
+    starter template's loading.py if it is present. Returns {table label: DataFrame with real headers}.
     """
+    if fname.lower().endswith((".accdb", ".mdb")):
+        try:
+            return _read_access(data)
+        except ImportError:
+            pass  # fall through to the starter's loader
     try:
-        import loading  # starter-template module; not part of this file set
+        import loading  # starter-template module
     except ImportError as exc:
         raise ValueError(
-            "this file type needs loading.py from the course starter template. "
+            "this file type needs the access-parser package (Access) or loading.py from the course starter. "
             "Alternatively export the tables to CSV or Excel."
         ) from exc
     res = loading.load_file(data, fname)
@@ -128,9 +153,9 @@ def _read_other(fname: str, data: bytes) -> dict[str, pd.DataFrame]:
 def load_tables(files: list[tuple[str, bytes]]):
     """
     Recognise E-Presso tables in a list of (filename, bytes).
-    CSV/TSV/TXT and Excel are read here (a workbook may hold several tables on separate sheets,
-    and a title row above the headers is tolerated). Other formats (Access, SQLite) go through
-    the starter template's loading.py. Returns (tables, messages, unrecognised).
+    CSV/TSV/TXT, Excel and Access are read natively (a workbook may hold several sheets, a title row above
+    the headers is tolerated, and sheets that are not data tables - e.g. documentation - are ignored).
+    Returns (tables, messages, unrecognised).
     """
     tables: dict[str, pd.DataFrame] = {}
     messages: list[str] = []
@@ -147,6 +172,7 @@ def load_tables(files: list[tuple[str, bytes]]):
         except Exception as exc:  # noqa: BLE001 - report any reader failure to the user
             unrecognised.append(f"{fname} (could not be read: {exc})")
             continue
+        file_hits, skipped = 0, []
         for sheet, (raw, headerless) in sheets.items():
             label = f"{fname}" + (f" [{sheet}]" if sheet else "")
             raw = raw.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
@@ -157,8 +183,9 @@ def load_tables(files: list[tuple[str, bytes]]):
             else:
                 found, df = _classify(raw), raw
             if not found:
-                unrecognised.append(label)
+                skipped.append(label)
                 continue
+            file_hits += 1
             table, rename = found
             df = df.rename(columns=rename)
             if table in tables:
@@ -166,6 +193,10 @@ def load_tables(files: list[tuple[str, bytes]]):
                 continue
             tables[table] = df
             messages.append(f"{label} -> {table} table ({len(df):,} rows)")
+        if file_hits:  # other sheets/tables in a file that did contain data are just ignored
+            messages += [f"{s} is not an E-Presso data table - ignored." for s in skipped]
+        else:
+            unrecognised += skipped or [fname]
     return tables, messages, unrecognised
 
 
@@ -887,7 +918,9 @@ def get_satisfaction_vs_revenue(fact, survey) -> dict:
         "caveats": [
             "Correlation is not causation: stores differ in size, market and location, and revenue can influence "
             "satisfaction as easily as the reverse.",
-            "Survey scale, sample sizes and response rates are not in the data.",
+            "Per the survey workbook's 'Terms and Definitions' sheet, Satisfaction is a 0-5 rating of the shopper's experience at their "
+            "local store and 'Interest' is a 0-100 rating of how much respondents value quality espresso products (not interest in E-Presso itself). "
+            "The number of respondents and response rates are not in the data.",
             "Locations without survey responses (such as the website) are excluded from the correlation.",
             "Large stores (high revenue) and small stores may differ systematically, which can drive the pattern.",
         ],
@@ -934,7 +967,7 @@ def get_data_limitations(ds: Dataset) -> dict:
                 "costs, expenses, operating or lease costs, margins or profit (revenue is NOT profit)",
                 "units sold or prices (revenue cannot be split into quantity x price)",
                 "customer-level data (survey is per location per year, not per customer)",
-                "survey response counts or scale definition",
+                "number of survey respondents or response rates (the survey is a per-location annual summary)",
                 "reasons for changes (the data cannot establish causes)",
             ],
             "profit_tool_available": False,

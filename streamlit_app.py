@@ -44,7 +44,7 @@ def money(x, cents=False) -> str:
 
 @st.cache_data(show_spinner=False)
 def bundled_files():
-    keep = {".csv", ".tsv", ".txt", ".xlsx"}
+    keep = {".csv", ".tsv", ".txt", ".xlsx", ".accdb"}
     return tuple((p.name, p.read_bytes()) for p in sorted(DATA_DIR.glob("*")) if p.suffix.lower() in keep)
 
 
@@ -86,7 +86,7 @@ with st.sidebar:
         "Upload an updated dataset (optional)",
         type=["csv", "tsv", "txt", "xlsx", "xls", "accdb", "mdb"],
         accept_multiple_files=True,
-        help="Upload Sales, Stores, Products, Categories and Survey files (CSV or Excel; Access needs loading.py). "
+        help="Upload Sales, Stores, Products, Categories and Survey files (CSV, Excel or Access). "
         "Tables are recognised by their columns, not file names. Uploaded files replace the bundled data.",
     )
     fill = st.checkbox("Use bundled data for any table I don't upload", value=True)
@@ -445,7 +445,7 @@ language-model agent (function calling); without one (or if the API fails or the
 never edits data, and every answer lists the function, arguments and raw result.
 
 **Known limitations**
-- Revenue only: no costs, units, prices, or customer-level data. Satisfaction survey has no response counts or scale definition and the website has no survey scores.
+- Revenue only: no costs, units, prices, or customer-level data. The survey (Satisfaction 0-5; "Interest" 0-100 = how much respondents value quality espresso products) has no respondent counts, and the website has no survey scores.
 - Comparisons that involve a year with fewer than 12 months are flagged as not like-for-like.
 - Correlation shown by the assistant is not causation.
         """
