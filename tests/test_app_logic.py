@@ -12,8 +12,12 @@ import agent  # noqa: E402
 import analytics as A  # noqa: E402
 
 
-def _load(folder=ROOT / "data", overrides=None):
-    files = [(p.name, p.read_bytes()) for p in sorted(Path(folder).glob("*.csv"))]
+def _source_files():
+    return [(p.name, p.read_bytes()) for p in sorted((ROOT / "data").glob("Support_EX_B_*"))]
+
+
+def _load(overrides=None):
+    files = _source_files()
     tables, _, _ = A.load_tables(files)
     if overrides:
         tables.update(overrides)
@@ -26,12 +30,32 @@ def ds():
 
 
 def raw_sales():
-    return pd.read_csv(ROOT / "data" / "sales.csv")
+    from access_parser import AccessParser
+    return pd.DataFrame(AccessParser(str(ROOT / "data" / "Support_EX_B_Sales.accdb")).parse_table("Sales"))
+
+
+def raw_stores():
+    return pd.read_csv(ROOT / "data" / "Support_EX_B_Stores.csv", sep="\t", dtype=str)
+
+
+def test_original_source_files_load_cleanly():
+    tables, msgs, unrec = A.load_tables(_source_files())
+    assert set(tables) == {"sales", "stores", "products", "categories", "survey"}
+    assert unrec == []  # the workbook's Documentation / Terms sheets are ignored quietly
+    assert len(tables["sales"]) == 25200 and len(tables["stores"]) == 21 and len(tables["survey"]) == 105
+
+
+def test_csv_sales_upload_with_other_tables_from_bundle_gives_same_total(ds):
+    sales_csv = raw_sales().to_csv(index=False).encode()
+    tables, _, unrec = A.load_tables([("sales.csv", sales_csv)])
+    assert list(tables) == ["sales"] and not unrec
+    full = {**_load().tables, **tables}
+    assert A.total_revenue(A.build_dataset(full).fact) == pytest.approx(A.total_revenue(ds.fact))
 
 
 # ---- data handling ----
 def test_total_matches_raw_sum_and_joins_do_not_duplicate(ds):
-    assert A.total_revenue(ds.fact) == pytest.approx(raw_sales()["Revenue"].sum())
+    assert A.total_revenue(ds.fact) == pytest.approx(raw_sales()["Revenue"].sum()) == pytest.approx(42174440.0)
     assert len(ds.fact) == len(raw_sales())
     assert all(r["OK"] for r in ds.reconciliation)
 
@@ -64,7 +88,8 @@ def test_filters_recalculate(ds):
 def test_adding_1000_changes_total_by_exactly_1000_and_one_bucket():
     base = _load()
     s = base.tables["sales"].copy()
-    s.loc[0, "Revenue"] = str(float(s.loc[0, "Revenue"]) + 1000)
+    s["Revenue"] = pd.to_numeric(s["Revenue"])
+    s.loc[0, "Revenue"] += 1000
     mod = _load(overrides={"sales": s})
     assert A.total_revenue(mod.fact) - A.total_revenue(base.fact) == pytest.approx(1000)
     for fn in (lambda d: A.revenue_by_year(d.fact), lambda d: A.revenue_by_month(d.fact)):
@@ -151,9 +176,8 @@ def test_rules_unsupported_and_profit_never_claims_profit(ds):
 
 def test_website_2028_matches_independent_calculation(ds):
     s = raw_sales()
-    stores = pd.read_csv(ROOT / "data" / "stores.csv")
-    m = s.merge(stores[["ID", "StoreType"]], left_on="Store ID", right_on="ID")
-    expected = m[(m["StoreType"] == "Website") & (m["Date"].str[:4] == "2028")]["Revenue"].sum()
+    m = s.merge(raw_stores()[["ID", "StoreType"]], left_on="Store ID", right_on="ID")
+    expected = m[(m["StoreType"] == "Website") & (m["Date"].astype(str).str[:4] == "2028")]["Revenue"].sum()
     got = agent.run_rules("How much revenue did the website generate in 2028?", ds, ds.fact, "full")["tool_log"][0]["result"]["total_revenue"]
     assert got == pytest.approx(expected)
 
@@ -204,3 +228,75 @@ def test_llm_answer_without_tool_is_flagged(ds):
     client = _FakeClient([_FakeResp(text="Revenue was $1."), _FakeResp(text="Revenue was $1.")])
     out = agent.answer_question("total revenue?", ds, ds.fact, "full", client=client)
     assert any("NOT verified" in n for n in out["notes"])
+
+
+# ---- the assistant answers exactly what is asked (single item vs list, metric, years) ----
+def _store_lines(answer: str) -> int:
+    return sum(1 for ln in answer.splitlines() if ln.startswith("- SH"))
+
+
+def test_singular_question_returns_one_store_not_five(ds):
+    out = agent.run_rules("Which store had the greatest revenue decline overall?", ds, ds.fact, "full")
+    call = out["tool_log"][0]
+    assert call["function"] == "get_store_trend"
+    assert call["arguments"]["top_n"] == 1 and call["arguments"]["direction"] == "decline"
+    assert len(call["result"]["stores"]) == 1
+    assert "SH11 - Chicago, IL" in out["answer"] and "Denver" not in out["answer"] and _store_lines(out["answer"]) == 0
+    assert "Five" not in out["answer"]
+
+
+def test_requested_count_is_respected(ds):
+    out = agent.run_rules("Show the top 3 stores with the biggest revenue decline", ds, ds.fact, "full")
+    assert out["tool_log"][0]["arguments"]["top_n"] == 3 and _store_lines(out["answer"]) == 3
+    plural = agent.run_rules("Which stores had the largest declines?", ds, ds.fact, "full")
+    assert _store_lines(plural["answer"]) == 5  # plural wording -> a short list
+
+
+def test_dollar_vs_percent_basis_follows_the_wording(ds):
+    pct = agent.run_rules("Which store had the greatest percentage decline?", ds, ds.fact, "full")["tool_log"][0]
+    usd = agent.run_rules("Which store had the greatest revenue decline?", ds, ds.fact, "full")["tool_log"][0]
+    assert pct["arguments"]["rank_by"] == "percent" and usd["arguments"]["rank_by"] == "dollars"
+    # independent check of the leader on each basis
+    s = raw_sales().merge(raw_stores()[["ID", "StoreType"]], left_on="Store ID", right_on="ID")
+    s = s[s["StoreType"] != "Website"]
+    py = s.pivot_table(index="Store ID", columns=s["Date"].astype(str).str[:4], values="Revenue", aggfunc="sum")
+    assert pct["result"]["stores"][0]["store_id"] == ((py["2029"] - py["2025"]) / py["2025"]).idxmin()
+    assert usd["result"]["stores"][0]["store_id"] == (py["2029"] - py["2025"]).idxmin()
+
+
+def test_year_in_the_question_is_used(ds):
+    one = agent.run_rules("Which store had the biggest decline in 2026?", ds, ds.fact, "full")["tool_log"][0]
+    assert (one["arguments"]["start_year"], one["arguments"]["end_year"]) == (2025, 2026)
+    two = agent.run_rules("Which store had the greatest decline from 2026 to 2028?", ds, ds.fact, "full")["tool_log"][0]
+    assert (two["arguments"]["start_year"], two["arguments"]["end_year"]) == (2026, 2028)
+    assert two["result"]["start_year"] == 2026 and two["result"]["end_year"] == 2028
+
+
+def test_no_decline_and_no_growth_are_stated_not_invented(ds):
+    grown = ds.fact.copy()
+    grown["Revenue"] = grown["Revenue"] * (1 + (grown["Year"] - grown["Year"].min()).astype(float))
+    ans = agent.run_rules("Which store had the greatest revenue decline?", ds, grown, "full")["answer"]
+    assert "No location had revenue decline" in ans
+    ans = agent.run_rules("Which store had the greatest revenue growth?", ds, ds.fact, "full")["answer"]
+    assert "No location had revenue growth" in ans and "website" in ans.lower()  # physical stores only, website excluded
+
+
+def test_lowest_and_highest_revenue_store(ds):
+    by_store = ds.fact.groupby("Store")["Revenue"].sum()
+    low = agent.run_rules("Which store has the lowest revenue?", ds, ds.fact, "full")["tool_log"][0]["result"]["ranking"]
+    high = agent.run_rules("Which store has the highest revenue?", ds, ds.fact, "full")["tool_log"][0]["result"]["ranking"]
+    assert len(low) == len(high) == 1
+    assert low[0]["store"] == by_store.idxmin() and high[0]["store"] == by_store.idxmax()
+
+
+def test_growth_word_grew_routes_to_growth(ds):
+    ans = agent.run_rules("Which category grew the most?", ds, ds.fact, "full")["answer"]
+    assert "greatest revenue growth" in ans and "Espresso Machines" in ans
+
+
+def test_tool_validates_direction_and_rank_by(ds):
+    assert "error" in A.get_store_trend(ds.fact, direction="sideways")
+    assert "error" in A.get_store_trend(ds.fact, direction="decline", rank_by="vibes")
+    r = A.get_store_trend(ds.fact, direction="decline", rank_by="percent", top_n=1)
+    assert len(r["stores"]) == 1 and r["stores"][0]["store_id"] == r["largest_pct_decline"]["store_id"]
+
