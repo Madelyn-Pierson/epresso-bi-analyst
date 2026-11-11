@@ -49,7 +49,11 @@ h1 { font-weight: 750 !important; }
 .stTabs [data-baseweb="tab-list"] { gap: 10px; border-bottom: 1px solid #E8E2DA; }
 .stTabs [data-baseweb="tab"] { color: #77736E; font-weight: 550; padding: 12px 15px; }
 .stTabs [aria-selected="true"] { color: #44352F !important; font-weight: 700; }
-.stTabs [data-baseweb="tab-highlight"] { background-color: #829B87; }
+.stTabs [data-baseweb="tab-highlight"] { background-color: #829B87 !important; }
+.stTabs [data-baseweb="tab-border"] { background-color: #E8E2DA; }
+.stSlider [data-baseweb="slider"] [role="slider"] { background-color: #829B87 !important; border-color: #829B87 !important; }
+.stSlider [data-baseweb="slider"] > div > div { color: #54715D; }
+[data-testid="stMetricLabel"] p { white-space: normal !important; overflow: visible !important; text-overflow: clip !important; line-height: 1.3; }
 .stButton > button { border-radius: 9px; }
 .stButton > button[kind="primary"] { background-color: #44352F; color: white; }
 [data-baseweb="select"] > div { border-radius: 9px; }
@@ -76,6 +80,7 @@ def style_chart(fig):
     )
     fig.update_xaxes(showgrid=False, linecolor=BORDER, tickfont=dict(color=MUTED), title_font=dict(color=MUTED), automargin=True)
     fig.update_yaxes(gridcolor="#F0ECE6", zeroline=False, tickfont=dict(color=MUTED), title_font=dict(color=MUTED), automargin=True)
+    fig.update_layout(autosize=True)
     return fig
 
 
@@ -217,7 +222,7 @@ def render_dashboard():
     cols = st.columns(2 + min(len(by_ch), 3) + 1, gap="small")
     cols[0].metric("Total revenue", compact_money(total), help=f"Exact total: {money(total, cents=True)}")
     for i, row in enumerate(by_ch.head(3).itertuples(index=False), start=1):
-        cols[i].metric(f"{row.Channel} revenue", compact_money(row.Revenue),
+        cols[i].metric(f"{row.Channel.replace('Brick & Mortar', 'In-store')} revenue", compact_money(row.Revenue),
                        f"{row._2:.1f}% of total", delta_color="off",
                        help=f"Exact revenue: {money(row.Revenue, cents=True)}")
     avg_month = total / n_months if n_months else None
@@ -226,53 +231,87 @@ def render_dashboard():
     cols[-1].metric("Sales rows", f"{len(f):,}")
 
     period = A.period_label(f)
-    left, right = st.columns(2)
+
+    # First row: the original annual and monthly revenue charts.
+    left, right = st.columns(2, gap="large")
     with left:
         by_year = A.revenue_by_year(f, by="Channel")
         fig = px.bar(by_year, x="Year", y="Revenue", color="Channel", barmode="stack",
                      title=f"Revenue by year and channel ({period})", labels={"Revenue": "Revenue ($)"})
         fig.update_xaxes(type="category")
-        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", legend_title_text="")
-        st.plotly_chart(style_chart(fig), width="stretch")
-        yt = A.revenue_by_year(f)
-        yt["Change vs prior year"] = yt["Revenue"].pct_change() * 100
-        yt["Months of data"] = yt["Year"].map(lambda y: A.months_present(f, y))
-        st.dataframe(
-            yt.assign(Revenue=yt["Revenue"].map(lambda v: money(v)), **{"Change vs prior year": yt["Change vs prior year"].map(lambda v: "" if pd.isna(v) else f"{v:+.1f}%")}),
-            hide_index=True, width="stretch",
-        )
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", legend_title_text="", height=440)
+        st.plotly_chart(style_chart(fig), use_container_width=True, config={"responsive": True})
     with right:
         m = A.revenue_by_month(f)
         m["Year"] = m["Year"].astype(str)
         fig = px.line(m, x="Month name", y="Revenue", color="Year", markers=True,
                       category_orders={"Month name": A.MONTH_NAMES}, title=f"Monthly revenue pattern ({period})",
                       labels={"Revenue": "Revenue ($)", "Month name": "Month"})
-        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
-        st.plotly_chart(style_chart(fig), width="stretch")
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", height=440)
+        st.plotly_chart(style_chart(fig), use_container_width=True, config={"responsive": True})
+
+    # Second row: the existing annual summary table and monthly-share heatmap.
+    # Placing them in a separate row keeps later charts from being pushed down
+    # by an oversized heatmap and prevents the large blank area seen previously.
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("**Annual revenue summary**")
+        yt = A.revenue_by_year(f)
+        yt["Change vs prior year"] = yt["Revenue"].pct_change() * 100
+        yt["Months of data"] = yt["Year"].map(lambda y: A.months_present(f, y))
+        st.dataframe(
+            yt.assign(Revenue=yt["Revenue"].map(lambda v: money(v)),
+                      **{"Change vs prior year": yt["Change vs prior year"].map(
+                          lambda v: "" if pd.isna(v) else f"{v:+.1f}%")}),
+            hide_index=True, use_container_width=True,
+        )
+    with right:
         ms = A.monthly_share(f)
         if not ms.empty:
             piv = ms.pivot(index="Year", columns="Month", values="Share of year %").reindex(columns=range(1, 13))
             piv.columns = A.MONTH_NAMES
-            fig = px.imshow(piv, text_auto=".1f", aspect="auto", color_continuous_scale=[[0, "#F0F4EF"], [0.25, "#D6E2D6"], [0.5, "#A9C1AD"], [0.75, "#829B87"], [1, "#3F6650"]],
-                            title="Each month as % of its own year's revenue (same filters)",
-                            labels={"color": "% of year", "x": "Month", "y": "Year"})
-            fig.update_yaxes(type="category")
-            st.plotly_chart(style_chart(fig), width="stretch")
+            fig = px.imshow(
+                piv, text_auto=".1f", aspect="auto",
+                color_continuous_scale=[
+                    [0, "#F0F4EF"], [0.25, "#D6E2D6"], [0.5, "#A9C1AD"],
+                    [0.75, "#829B87"], [1, "#3F6650"],
+                ],
+                title="Monthly share of annual revenue (%)",
+                labels={"color": "% of year", "x": "Month", "y": "Year"},
+            )
+            fig.update_yaxes(type="category", showgrid=False)
+            fig.update_xaxes(tickangle=0, showgrid=False)
+            fig.update_layout(
+                height=335,
+                margin=dict(l=55, r=10, t=60, b=50),
+                coloraxis_colorbar=dict(title="% of year", thickness=12, len=0.75),
+            )
+            st.plotly_chart(style_chart(fig), use_container_width=True, config={"responsive": True})
 
-    c1, c2 = st.columns(2)
+    # Third row: original store ranking and category revenue charts.
+    c1, c2 = st.columns(2, gap="large")
     with c1:
-        n_show = st.slider("Stores to show", 3, max(3, f["Store"].nunique()), min(10, max(3, f["Store"].nunique())), key=f"nshow_{sig}") if f["Store"].nunique() > 3 else f["Store"].nunique()
+        n_show = st.slider("Stores to show", 3, max(3, f["Store"].nunique()),
+                           min(10, max(3, f["Store"].nunique())), key=f"nshow_{sig}") if f["Store"].nunique() > 3 else f["Store"].nunique()
         by_store = A.revenue_by(f, "Store").head(n_show).iloc[::-1]
-        fig = px.bar(by_store, x="Revenue", y="Store", orientation="h", title=f"Revenue by store, top {n_show} ({period})",
+        fig = px.bar(by_store, x="Revenue", y="Store", orientation="h",
+                     title=f"Revenue by store, top {n_show} ({period})",
                      labels={"Revenue": "Revenue ($)"})
-        fig.update_layout(xaxis_tickprefix="$", xaxis_tickformat=",.0f")
-        st.plotly_chart(style_chart(fig), width="stretch")
+        fig.update_layout(xaxis_tickprefix="$", xaxis_tickformat=",.0f",
+                          height=max(400, 45 * len(by_store) + 130))
+        fig = style_chart(fig)
+        fig.update_layout(margin=dict(l=155, r=15, t=65, b=55))
+        st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
     with c2:
         by_cat = A.revenue_by(f, "Category")
-        fig = px.bar(by_cat, x="Category", y="Revenue", title=f"Revenue by product category ({period})",
-                     labels={"Revenue": "Revenue ($)"}, text=by_cat["Share %"].map(lambda v: f"{v:.1f}%"))
-        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
-        st.plotly_chart(style_chart(fig), width="stretch")
+        fig = px.bar(by_cat, x="Category", y="Revenue",
+                     title=f"Revenue by product category ({period})",
+                     labels={"Revenue": "Revenue ($)"},
+                     text=by_cat["Share %"].map(lambda v: f"{v:.1f}%"))
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", height=500)
+        fig.update_xaxes(tickangle=-30)
+        fig.update_traces(textposition="outside", cliponaxis=False)
+        st.plotly_chart(style_chart(fig), use_container_width=True, config={"responsive": True})
 
     with st.expander("Filtered records"):
         st.dataframe(f.head(500), hide_index=True, width="stretch")
@@ -530,4 +569,3 @@ for tab, fn in [(tab_dash, render_dashboard), (tab_profile, render_profile), (ta
         except Exception as exc:  # noqa: BLE001 - show the real error (Streamlit Cloud redacts it otherwise)
             st.error(f"{fn.__name__} failed: {type(exc).__name__}: {exc}")
             st.code(traceback.format_exc())
-
