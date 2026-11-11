@@ -25,6 +25,71 @@ MAX_QUESTION_CHARS = 500
 
 st.set_page_config(page_title="E-Presso BI Analyst", page_icon="☕", layout="wide")
 
+# ------------------------------------------------------------ visual theme
+ESPRESSO = "#44352F"
+CREAM = "#F7F4EF"
+SAGE = "#829B87"
+TEXT = "#302C29"
+MUTED = "#77736E"
+BORDER = "#E8E2DA"
+WHITE = "#FFFFFF"
+
+st.markdown("""
+<style>
+.stApp { background-color: #F7F4EF; color: #302C29; }
+.block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1500px; }
+h1, h2, h3 { color: #44352F !important; letter-spacing: -0.4px; }
+h1 { font-weight: 750 !important; }
+[data-testid="stCaptionContainer"] { color: #77736E; }
+[data-testid="stSidebar"] { background-color: #EFEAE2; border-right: 1px solid #E1DAD0; }
+[data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #E8E2DA; border-radius: 14px; padding: 18px 14px; box-shadow: 0 3px 12px rgba(68,53,47,.035); min-width: 0; }
+[data-testid="stMetricLabel"] { color: #77736E; font-size: .88rem; }
+[data-testid="stMetricValue"] { color: #44352F; }
+[data-testid="stMetricValue"] > div { font-size: clamp(1.1rem, 1.8vw, 1.8rem); font-weight: 700; }
+.stTabs [data-baseweb="tab-list"] { gap: 10px; border-bottom: 1px solid #E8E2DA; }
+.stTabs [data-baseweb="tab"] { color: #77736E; font-weight: 550; padding: 12px 15px; }
+.stTabs [aria-selected="true"] { color: #44352F !important; font-weight: 700; }
+.stTabs [data-baseweb="tab-highlight"] { background-color: #829B87; }
+.stButton > button { border-radius: 9px; }
+.stButton > button[kind="primary"] { background-color: #44352F; color: white; }
+[data-baseweb="select"] > div { border-radius: 9px; }
+[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+[data-testid="stExpander"] { background-color: #FFFFFF; border: 1px solid #E8E2DA; border-radius: 12px; }
+[data-testid="stChatMessage"] { border-radius: 12px; border: 1px solid #E8E2DA; background-color: #FFFFFF; }
+hr { border-color: #E8E2DA; }
+</style>
+""", unsafe_allow_html=True)
+
+px.defaults.template = "plotly_white"
+px.defaults.color_discrete_sequence = [ESPRESSO, SAGE, "#B69B82", "#6C8274", "#D0BDA8", "#A8B7A5", "#8A7464"]
+
+
+def style_chart(fig):
+    """Style an existing Plotly figure without changing its data or chart type."""
+    fig.update_layout(
+        paper_bgcolor=WHITE, plot_bgcolor=WHITE,
+        font=dict(family="Arial, sans-serif", color=TEXT, size=12),
+        title=dict(font=dict(size=15, color=ESPRESSO), x=0.02, xanchor="left"),
+        margin=dict(l=35, r=25, t=75, b=45),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+        hoverlabel=dict(bgcolor=WHITE, font_color=TEXT),
+    )
+    fig.update_xaxes(showgrid=False, linecolor=BORDER, tickfont=dict(color=MUTED), title_font=dict(color=MUTED), automargin=True)
+    fig.update_yaxes(gridcolor="#F0ECE6", zeroline=False, tickfont=dict(color=MUTED), title_font=dict(color=MUTED), automargin=True)
+    return fig
+
+
+def compact_money(value):
+    """Short KPI labels; exact dollar amounts remain available in tooltips."""
+    if value is None or pd.isna(value):
+        return "n/a"
+    if abs(value) >= 1_000_000:
+        return f"${value / 1_000_000:,.2f}M"
+    if abs(value) >= 1_000:
+        return f"${value / 1_000:,.1f}K"
+    return money(value)
+
+
 
 # ------------------------------------------------------------------ helpers
 def get_secret(name: str, default=None):
@@ -149,11 +214,15 @@ def render_dashboard():
     by_ch = A.revenue_by(f, "Channel")
     n_months = f.dropna(subset=["Year", "Month"])[["Year", "Month"]].drop_duplicates().shape[0]
 
-    cols = st.columns(2 + min(len(by_ch), 3) + 1)
-    cols[0].metric("Total revenue", money(total), help="Sum of Revenue for the filtered rows.")
+    cols = st.columns(2 + min(len(by_ch), 3) + 1, gap="small")
+    cols[0].metric("Total revenue", compact_money(total), help=f"Exact total: {money(total, cents=True)}")
     for i, row in enumerate(by_ch.head(3).itertuples(index=False), start=1):
-        cols[i].metric(f"{row.Channel} revenue", money(row.Revenue), f"{row._2:.1f}% of total", delta_color="off")
-    cols[-2].metric("Average per month", money(total / n_months) if n_months else "n/a", help="Total revenue / months with data.")
+        cols[i].metric(f"{row.Channel} revenue", compact_money(row.Revenue),
+                       f"{row._2:.1f}% of total", delta_color="off",
+                       help=f"Exact revenue: {money(row.Revenue, cents=True)}")
+    avg_month = total / n_months if n_months else None
+    cols[-2].metric("Average per month", compact_money(avg_month),
+                    help=f"Exact average: {money(avg_month, cents=True)}" if avg_month is not None else "No months available")
     cols[-1].metric("Sales rows", f"{len(f):,}")
 
     period = A.period_label(f)
@@ -164,7 +233,7 @@ def render_dashboard():
                      title=f"Revenue by year and channel ({period})", labels={"Revenue": "Revenue ($)"})
         fig.update_xaxes(type="category")
         fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", legend_title_text="")
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(style_chart(fig), width="stretch")
         yt = A.revenue_by_year(f)
         yt["Change vs prior year"] = yt["Revenue"].pct_change() * 100
         yt["Months of data"] = yt["Year"].map(lambda y: A.months_present(f, y))
@@ -179,16 +248,16 @@ def render_dashboard():
                       category_orders={"Month name": A.MONTH_NAMES}, title=f"Monthly revenue pattern ({period})",
                       labels={"Revenue": "Revenue ($)", "Month name": "Month"})
         fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(style_chart(fig), width="stretch")
         ms = A.monthly_share(f)
         if not ms.empty:
             piv = ms.pivot(index="Year", columns="Month", values="Share of year %").reindex(columns=range(1, 13))
             piv.columns = A.MONTH_NAMES
-            fig = px.imshow(piv, text_auto=".1f", aspect="auto", color_continuous_scale="Blues",
+            fig = px.imshow(piv, text_auto=".1f", aspect="auto", color_continuous_scale=[[0, "#F0F4EF"], [0.25, "#D6E2D6"], [0.5, "#A9C1AD"], [0.75, "#829B87"], [1, "#3F6650"]],
                             title="Each month as % of its own year's revenue (same filters)",
                             labels={"color": "% of year", "x": "Month", "y": "Year"})
             fig.update_yaxes(type="category")
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(style_chart(fig), width="stretch")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -197,13 +266,13 @@ def render_dashboard():
         fig = px.bar(by_store, x="Revenue", y="Store", orientation="h", title=f"Revenue by store, top {n_show} ({period})",
                      labels={"Revenue": "Revenue ($)"})
         fig.update_layout(xaxis_tickprefix="$", xaxis_tickformat=",.0f")
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(style_chart(fig), width="stretch")
     with c2:
         by_cat = A.revenue_by(f, "Category")
         fig = px.bar(by_cat, x="Category", y="Revenue", title=f"Revenue by product category ({period})",
                      labels={"Revenue": "Revenue ($)"}, text=by_cat["Share %"].map(lambda v: f"{v:.1f}%"))
         fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f")
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(style_chart(fig), width="stretch")
 
     with st.expander("Filtered records"):
         st.dataframe(f.head(500), hide_index=True, width="stretch")
@@ -461,3 +530,4 @@ for tab, fn in [(tab_dash, render_dashboard), (tab_profile, render_profile), (ta
         except Exception as exc:  # noqa: BLE001 - show the real error (Streamlit Cloud redacts it otherwise)
             st.error(f"{fn.__name__} failed: {type(exc).__name__}: {exc}")
             st.code(traceback.format_exc())
+
