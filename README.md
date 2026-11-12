@@ -6,7 +6,7 @@ The E-Presso BI Analyst is a web app that helps a manager understand how E-Press
 
 ## Live app
 
-https://bi-analysis-madelyn-emily.streamlit.app/
+https://bi-analysis-madelyn-emily-amalea.streamlit.app/ 
 
 The app may take a moment to wake up if it has not been used recently.
 
