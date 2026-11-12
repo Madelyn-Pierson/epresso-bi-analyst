@@ -568,11 +568,12 @@ def run_llm(question: str, ds: A.Dataset, fact, scope: str, client, model: str) 
                 result = run_tool(fc.name, dict(fc.args or {}), ds, fact, scope, log)
                 parts.append(types.Part.from_function_response(name=fc.name, response={"result": result}))
             contents.append(types.Content(role="user", parts=parts))
+   
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         if any(t in msg for t in ("429", "RESOURCE_EXHAUSTED", "quota", "Quota")):
             raise LLMUnavailable("the model API quota is used up") from exc
-    raise LLMUnavailable(f"model API error ({type(exc).__name__}): {str(exc)[:500]}") from exc
+        raise LLMUnavailable(f"model API error ({type(exc).__name__}): {str(exc)[:500]}") from exc
 
     notes = []
     if not final_text:
