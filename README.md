@@ -159,13 +159,3 @@ Run the tests from the repository root:
 python -m pytest -q
 ```
 
-## Secrets
-
-Never commit API keys. Use Streamlit Secrets (see `.streamlit/secrets.toml.example`).
-
-| Secret | Required? | Purpose |
-|---|---|---|
-| `GEMINI_API_KEY` | No | Turns on the language-model assistant. Without it the app uses the rules-based assistant. |
-| `GEMINI_MODEL` | No | Model name (default `gemini-2.5-flash`). |
-| `MAX_QUESTIONS` | No | Questions allowed per session (default 15). |
-
